@@ -71,6 +71,24 @@ CREATE TYPE "public"."app_role" AS ENUM (
 ALTER TYPE "public"."app_role" OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."block_unknown_google_signup"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF NEW.raw_app_meta_data->>'provider' = 'google'
+     AND NOT EXISTS (SELECT 1 FROM public.profiles WHERE email = NEW.email)
+  THEN
+    RAISE EXCEPTION 'signup_disabled: no existing account for this email';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."block_unknown_google_signup"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."can_access_business"("_user_id" "uuid", "_business_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -168,11 +186,11 @@ $$;
 ALTER FUNCTION "public"."get_owner_client_id"("_user_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_public_agency_info"() RETURNS TABLE("company_name" "text", "phone" "text", "website" "text")
+CREATE OR REPLACE FUNCTION "public"."get_public_agency_info"() RETURNS TABLE("company_name" "text", "phone" "text", "website" "text", "meta_pixel_id" "text", "google_tag_id" "text", "custom_tracking_html" "text")
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  SELECT company_name, phone, website
+  SELECT company_name, phone, website, meta_pixel_id, google_tag_id, custom_tracking_html
   FROM public.agency_settings
   LIMIT 1;
 $$;
@@ -369,7 +387,10 @@ CREATE TABLE IF NOT EXISTS "public"."agency_settings" (
     "website" "text" DEFAULT ''::"text" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "notifications_webhook_url" "text"
+    "notifications_webhook_url" "text",
+    "meta_pixel_id" "text",
+    "google_tag_id" "text",
+    "custom_tracking_html" "text"
 );
 
 
@@ -606,7 +627,8 @@ CREATE TABLE IF NOT EXISTS "public"."leads" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "business_id" "uuid",
-    "status_updated_at" timestamp with time zone
+    "status_updated_at" timestamp with time zone,
+    "additional_details" "text" DEFAULT ''::"text"
 );
 
 ALTER TABLE ONLY "public"."leads" REPLICA IDENTITY FULL;
@@ -2081,6 +2103,11 @@ GRANT USAGE ON SCHEMA "public" TO "service_role";
 
 
 
+REVOKE ALL ON FUNCTION "public"."block_unknown_google_signup"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."block_unknown_google_signup"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."can_access_business"("_user_id" "uuid", "_business_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."can_access_business"("_user_id" "uuid", "_business_id" "uuid") TO "service_role";
 
@@ -2106,6 +2133,7 @@ GRANT ALL ON FUNCTION "public"."get_owner_client_id"("_user_id" "uuid") TO "serv
 
 
 
+GRANT ALL ON FUNCTION "public"."get_public_agency_info"() TO "anon";
 GRANT ALL ON FUNCTION "public"."get_public_agency_info"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_public_agency_info"() TO "service_role";
 
