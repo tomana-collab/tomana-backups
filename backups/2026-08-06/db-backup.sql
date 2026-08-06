@@ -71,6 +71,38 @@ CREATE TYPE "public"."app_role" AS ENUM (
 ALTER TYPE "public"."app_role" OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."auto_create_lead_from_call"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  new_lead_id uuid;
+BEGIN
+  INSERT INTO public.leads (client_id, business_id, full_name, phone, source, status, notes)
+  VALUES (
+    NEW.client_id,
+    NEW.business_id,
+    COALESCE(NULLIF(NEW.cli, ''), 'שיחה נכנסת'),
+    NEW.cli,
+    'שיחה נכנסת (Maskyo)',
+    'חדש',
+    concat_ws(' · ',
+      NULLIF(concat_ws(' ', NEW.call_date, NEW.call_time), ''),
+      CASE WHEN NEW.call_status <> '' THEN 'סטטוס שיחה: ' || NEW.call_status END,
+      CASE WHEN NEW.destination <> '' THEN 'יעד: ' || NEW.destination END
+    )
+  )
+  RETURNING id INTO new_lead_id;
+
+  NEW.lead_id := new_lead_id;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."auto_create_lead_from_call"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."block_unknown_google_signup"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -118,6 +150,54 @@ END$$;
 
 
 ALTER FUNCTION "public"."cleanup_client_employee_user"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."client_has_active_call_webhook"("_business_id" "uuid" DEFAULT NULL::"uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.incoming_call_webhook_keys k
+    WHERE k.is_active = true
+      AND (_business_id IS NULL OR k.business_id = _business_id)
+      AND (
+        public.has_role(auth.uid(), 'admin')
+        OR public.has_role(auth.uid(), 'employee')
+        OR EXISTS (SELECT 1 FROM public.clients c WHERE c.id = k.client_id AND c.user_id = auth.uid())
+        OR (
+          public.is_client_employee(auth.uid())
+          AND k.client_id = public.get_owner_client_id(auth.uid())
+          AND (_business_id IS NULL OR k.business_id = ANY(public.get_allowed_business_ids(auth.uid())))
+        )
+      )
+  );
+$$;
+
+
+ALTER FUNCTION "public"."client_has_active_call_webhook"("_business_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."disable_webhooks_on_client_inactive"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF NEW.status IS DISTINCT FROM OLD.status AND NEW.status IS DISTINCT FROM 'פעיל' THEN
+    UPDATE public.incoming_webhook_keys
+      SET is_active = false
+      WHERE client_id = NEW.id AND is_active = true;
+
+    UPDATE public.incoming_call_webhook_keys
+      SET is_active = false
+      WHERE client_id = NEW.id AND is_active = true;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."disable_webhooks_on_client_inactive"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_allowed_business_ids"("_user_id" "uuid") RETURNS "uuid"[]
@@ -461,6 +541,55 @@ ALTER TABLE ONLY "public"."businesses" REPLICA IDENTITY FULL;
 ALTER TABLE "public"."businesses" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."call_webhook_logs" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "webhook_key_id" "uuid",
+    "status" "text" DEFAULT 'success'::"text" NOT NULL,
+    "http_status" integer DEFAULT 200 NOT NULL,
+    "error_message" "text",
+    "raw_query" "jsonb",
+    "ip_address" "text",
+    "processing_ms" integer,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."call_webhook_logs" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."call_webhook_rate_limits" (
+    "webhook_key_id" "uuid" NOT NULL,
+    "window_start" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "request_count" integer DEFAULT 0 NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."call_webhook_rate_limits" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."calls" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "client_id" "uuid" NOT NULL,
+    "business_id" "uuid" NOT NULL,
+    "webhook_key_id" "uuid",
+    "cli" "text" DEFAULT ''::"text" NOT NULL,
+    "destination" "text" DEFAULT ''::"text" NOT NULL,
+    "call_status" "text" DEFAULT ''::"text" NOT NULL,
+    "user_fild1" "text" DEFAULT ''::"text" NOT NULL,
+    "call_date" "text" DEFAULT ''::"text" NOT NULL,
+    "call_time" "text" DEFAULT ''::"text" NOT NULL,
+    "received_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "lead_id" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+ALTER TABLE ONLY "public"."calls" REPLICA IDENTITY FULL;
+
+
+ALTER TABLE "public"."calls" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."client_employees" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "client_id" "uuid" NOT NULL,
@@ -595,6 +724,22 @@ ALTER TABLE ONLY "public"."freelancer_tasks" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."freelancer_tasks" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."incoming_call_webhook_keys" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "token" "text" DEFAULT "encode"("extensions"."gen_random_bytes"(24), 'hex'::"text") NOT NULL,
+    "name" "text" DEFAULT ''::"text" NOT NULL,
+    "client_id" "uuid" NOT NULL,
+    "business_id" "uuid" NOT NULL,
+    "is_active" boolean DEFAULT true NOT NULL,
+    "created_by" "uuid" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."incoming_call_webhook_keys" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."incoming_webhook_keys" (
@@ -930,6 +1075,21 @@ ALTER TABLE ONLY "public"."businesses"
 
 
 
+ALTER TABLE ONLY "public"."call_webhook_logs"
+    ADD CONSTRAINT "call_webhook_logs_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."call_webhook_rate_limits"
+    ADD CONSTRAINT "call_webhook_rate_limits_pkey" PRIMARY KEY ("webhook_key_id");
+
+
+
+ALTER TABLE ONLY "public"."calls"
+    ADD CONSTRAINT "calls_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."client_employees"
     ADD CONSTRAINT "client_employees_pkey" PRIMARY KEY ("id");
 
@@ -977,6 +1137,16 @@ ALTER TABLE ONLY "public"."freelancer_task_comments"
 
 ALTER TABLE ONLY "public"."freelancer_tasks"
     ADD CONSTRAINT "freelancer_tasks_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."incoming_call_webhook_keys"
+    ADD CONSTRAINT "incoming_call_webhook_keys_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."incoming_call_webhook_keys"
+    ADD CONSTRAINT "incoming_call_webhook_keys_token_key" UNIQUE ("token");
 
 
 
@@ -1090,6 +1260,22 @@ ALTER TABLE ONLY "public"."webhook_rate_limits"
 
 
 
+CREATE INDEX "call_webhook_logs_created_at_idx" ON "public"."call_webhook_logs" USING "btree" ("created_at" DESC);
+
+
+
+CREATE INDEX "calls_business_id_idx" ON "public"."calls" USING "btree" ("business_id");
+
+
+
+CREATE INDEX "calls_client_id_idx" ON "public"."calls" USING "btree" ("client_id");
+
+
+
+CREATE INDEX "calls_received_at_idx" ON "public"."calls" USING "btree" ("received_at" DESC);
+
+
+
 CREATE INDEX "idx_admin_audit_log_created_at" ON "public"."admin_audit_log" USING "btree" ("created_at" DESC);
 
 
@@ -1130,11 +1316,19 @@ CREATE OR REPLACE TRIGGER "leads_status_updated_at" BEFORE UPDATE ON "public"."l
 
 
 
+CREATE OR REPLACE TRIGGER "trg_auto_create_lead_from_call" BEFORE INSERT ON "public"."calls" FOR EACH ROW EXECUTE FUNCTION "public"."auto_create_lead_from_call"();
+
+
+
 CREATE OR REPLACE TRIGGER "trg_cleanup_client_employee_user" AFTER DELETE ON "public"."client_employees" FOR EACH ROW EXECUTE FUNCTION "public"."cleanup_client_employee_user"();
 
 
 
 CREATE OR REPLACE TRIGGER "trg_client_employees_updated_at" BEFORE UPDATE ON "public"."client_employees" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_disable_webhooks_on_client_inactive" AFTER UPDATE OF "status" ON "public"."clients" FOR EACH ROW EXECUTE FUNCTION "public"."disable_webhooks_on_client_inactive"();
 
 
 
@@ -1171,6 +1365,10 @@ CREATE OR REPLACE TRIGGER "update_freelancer_services_updated_at" BEFORE UPDATE 
 
 
 CREATE OR REPLACE TRIGGER "update_freelancer_tasks_updated_at" BEFORE UPDATE ON "public"."freelancer_tasks" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_incoming_call_webhook_keys_updated_at" BEFORE UPDATE ON "public"."incoming_call_webhook_keys" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
 
@@ -1223,6 +1421,36 @@ ALTER TABLE ONLY "public"."businesses"
 
 
 
+ALTER TABLE ONLY "public"."call_webhook_logs"
+    ADD CONSTRAINT "call_webhook_logs_webhook_key_id_fkey" FOREIGN KEY ("webhook_key_id") REFERENCES "public"."incoming_call_webhook_keys"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."call_webhook_rate_limits"
+    ADD CONSTRAINT "call_webhook_rate_limits_webhook_key_id_fkey" FOREIGN KEY ("webhook_key_id") REFERENCES "public"."incoming_call_webhook_keys"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."calls"
+    ADD CONSTRAINT "calls_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."calls"
+    ADD CONSTRAINT "calls_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."calls"
+    ADD CONSTRAINT "calls_lead_id_fkey" FOREIGN KEY ("lead_id") REFERENCES "public"."leads"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."calls"
+    ADD CONSTRAINT "calls_webhook_key_id_fkey" FOREIGN KEY ("webhook_key_id") REFERENCES "public"."incoming_call_webhook_keys"("id") ON DELETE SET NULL;
+
+
+
 ALTER TABLE ONLY "public"."client_employees"
     ADD CONSTRAINT "client_employees_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
 
@@ -1270,6 +1498,16 @@ ALTER TABLE ONLY "public"."freelancer_tasks"
 
 ALTER TABLE ONLY "public"."freelancer_tasks"
     ADD CONSTRAINT "freelancer_tasks_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."incoming_call_webhook_keys"
+    ADD CONSTRAINT "incoming_call_webhook_keys_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."incoming_call_webhook_keys"
+    ADD CONSTRAINT "incoming_call_webhook_keys_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
 
 
 
@@ -1396,6 +1634,14 @@ CREATE POLICY "Admins can manage agency settings" ON "public"."agency_settings" 
 
 
 
+CREATE POLICY "Admins can manage call webhook keys" ON "public"."incoming_call_webhook_keys" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
+CREATE POLICY "Admins can manage call webhook logs" ON "public"."call_webhook_logs" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
 CREATE POLICY "Admins can manage freelancer services" ON "public"."freelancer_services" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
@@ -1429,6 +1675,10 @@ CREATE POLICY "Admins can manage webhook logs" ON "public"."webhook_logs" TO "au
 
 
 CREATE POLICY "Admins can read all roles" ON "public"."user_roles" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
+CREATE POLICY "Admins can view call rate limits" ON "public"."call_webhook_rate_limits" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
 
@@ -1493,6 +1743,12 @@ CREATE POLICY "Client can update own leads" ON "public"."leads" FOR UPDATE TO "a
 CREATE POLICY "Client can view own businesses" ON "public"."businesses" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."clients"
   WHERE (("clients"."id" = "businesses"."client_id") AND ("clients"."user_id" = "auth"."uid"())))));
+
+
+
+CREATE POLICY "Client can view own calls" ON "public"."calls" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
+   FROM "public"."clients"
+  WHERE (("clients"."id" = "calls"."client_id") AND ("clients"."user_id" = "auth"."uid"())))));
 
 
 
@@ -1578,6 +1834,10 @@ CREATE POLICY "Client employee can update leads" ON "public"."leads" FOR UPDATE 
 
 
 CREATE POLICY "Client employee can view businesses" ON "public"."businesses" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND ("id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))));
+
+
+
+CREATE POLICY "Client employee can view calls" ON "public"."calls" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"()))))));
 
 
 
@@ -1703,6 +1963,10 @@ CREATE POLICY "Staff can manage businesses" ON "public"."businesses" TO "authent
 
 
 
+CREATE POLICY "Staff can manage calls" ON "public"."calls" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role")));
+
+
+
 CREATE POLICY "Staff can manage clients" ON "public"."clients" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role")));
 
 
@@ -1794,6 +2058,15 @@ ALTER TABLE "public"."business_targets" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."businesses" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."call_webhook_logs" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."call_webhook_rate_limits" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."calls" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."client_employees" ENABLE ROW LEVEL SECURITY;
 
 
@@ -1816,6 +2089,9 @@ ALTER TABLE "public"."freelancer_task_comments" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."freelancer_tasks" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."incoming_call_webhook_keys" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."incoming_webhook_keys" ENABLE ROW LEVEL SECURITY;
@@ -1878,7 +2154,19 @@ ALTER PUBLICATION "supabase_realtime" OWNER TO "postgres";
 
 
 
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."admin_audit_log";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."agency_settings";
+
+
+
 ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."business_metrics";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."business_targets";
 
 
 
@@ -1886,7 +2174,19 @@ ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."businesses";
 
 
 
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."calls";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."client_employees";
+
+
+
 ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."clients";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."documents";
 
 
 
@@ -1894,7 +2194,23 @@ ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."freelancer_messag
 
 
 
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."freelancer_services";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."freelancer_task_comments";
+
+
+
 ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."freelancer_tasks";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."incoming_call_webhook_keys";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."incoming_webhook_keys";
 
 
 
@@ -1906,11 +2222,27 @@ ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."messages";
 
 
 
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."outgoing_webhook_attempts";
+
+
+
 ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."peer_reviews";
 
 
 
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."profiles";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."projects";
+
+
+
 ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."reminders";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."reports";
 
 
 
@@ -1919,6 +2251,22 @@ ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."request_replies";
 
 
 ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."requests";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."team_details";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."user_roles";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."webhook_dlq";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."webhook_logs";
 
 
 
@@ -2103,6 +2451,12 @@ GRANT USAGE ON SCHEMA "public" TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."auto_create_lead_from_call"() TO "anon";
+GRANT ALL ON FUNCTION "public"."auto_create_lead_from_call"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."auto_create_lead_from_call"() TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."block_unknown_google_signup"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."block_unknown_google_signup"() TO "service_role";
 
@@ -2115,6 +2469,17 @@ GRANT ALL ON FUNCTION "public"."can_access_business"("_user_id" "uuid", "_busine
 
 GRANT ALL ON FUNCTION "public"."cleanup_client_employee_user"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."cleanup_client_employee_user"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."client_has_active_call_webhook"("_business_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."client_has_active_call_webhook"("_business_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."disable_webhooks_on_client_inactive"() TO "anon";
+GRANT ALL ON FUNCTION "public"."disable_webhooks_on_client_inactive"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."disable_webhooks_on_client_inactive"() TO "service_role";
 
 
 
@@ -2240,6 +2605,24 @@ GRANT ALL ON TABLE "public"."businesses" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."call_webhook_logs" TO "anon";
+GRANT ALL ON TABLE "public"."call_webhook_logs" TO "authenticated";
+GRANT ALL ON TABLE "public"."call_webhook_logs" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."call_webhook_rate_limits" TO "anon";
+GRANT ALL ON TABLE "public"."call_webhook_rate_limits" TO "authenticated";
+GRANT ALL ON TABLE "public"."call_webhook_rate_limits" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."calls" TO "anon";
+GRANT ALL ON TABLE "public"."calls" TO "authenticated";
+GRANT ALL ON TABLE "public"."calls" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."client_employees" TO "anon";
 GRANT ALL ON TABLE "public"."client_employees" TO "authenticated";
 GRANT ALL ON TABLE "public"."client_employees" TO "service_role";
@@ -2285,6 +2668,12 @@ GRANT ALL ON TABLE "public"."freelancer_task_comments" TO "service_role";
 GRANT ALL ON TABLE "public"."freelancer_tasks" TO "anon";
 GRANT ALL ON TABLE "public"."freelancer_tasks" TO "authenticated";
 GRANT ALL ON TABLE "public"."freelancer_tasks" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."incoming_call_webhook_keys" TO "anon";
+GRANT ALL ON TABLE "public"."incoming_call_webhook_keys" TO "authenticated";
+GRANT ALL ON TABLE "public"."incoming_call_webhook_keys" TO "service_role";
 
 
 
