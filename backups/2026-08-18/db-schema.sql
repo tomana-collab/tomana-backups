@@ -76,8 +76,28 @@ CREATE OR REPLACE FUNCTION "public"."auto_create_lead_from_call"() RETURNS "trig
     SET "search_path" TO 'public'
     AS $$
 DECLARE
+  existing_lead_id uuid;
   new_lead_id uuid;
 BEGIN
+  IF NULLIF(NEW.cli, '') IS NOT NULL THEN
+    SELECT id INTO existing_lead_id
+    FROM public.leads
+    WHERE client_id = NEW.client_id
+      AND business_id = NEW.business_id
+      AND phone = NEW.cli
+      AND source = 'הפניה טלפונית'
+      AND status <> 'נסגר'
+      AND (created_at AT TIME ZONE 'Asia/Jerusalem')::date
+        = (NEW.received_at AT TIME ZONE 'Asia/Jerusalem')::date
+    ORDER BY created_at DESC
+    LIMIT 1;
+  END IF;
+
+  IF existing_lead_id IS NOT NULL THEN
+    NEW.lead_id := existing_lead_id;
+    RETURN NEW;
+  END IF;
+
   INSERT INTO public.leads (client_id, business_id, full_name, phone, source, status, notes)
   VALUES (
     NEW.client_id,
@@ -146,6 +166,25 @@ END$$;
 
 
 ALTER FUNCTION "public"."cleanup_client_employee_user"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."clear_health_status_on_deactivate"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  -- health_status/health_reasons הן NOT NULL (ברירת המחדל 'ok'/'{}') - אז
+  -- "ניקוי" כאן אומר איפוס לברירת המחדל הנייטרלית, לא NULL
+  IF NEW.status <> 'פעיל' THEN
+    NEW.health_status := 'ok';
+    NEW.health_reasons := '{}';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."clear_health_status_on_deactivate"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."client_has_active_call_webhook"("_business_id" "uuid" DEFAULT NULL::"uuid") RETURNS boolean
@@ -352,6 +391,26 @@ $$;
 
 
 ALTER FUNCTION "public"."is_client_employee"("_user_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."record_lead_status_change"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    INSERT INTO public.lead_status_history (lead_id, old_status, new_status)
+    VALUES (NEW.id, NULL, NEW.status);
+  ELSIF NEW.status IS DISTINCT FROM OLD.status THEN
+    INSERT INTO public.lead_status_history (lead_id, old_status, new_status)
+    VALUES (NEW.id, OLD.status, NEW.status);
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."record_lead_status_change"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."rls_auto_enable"() RETURNS "event_trigger"
@@ -803,6 +862,19 @@ CREATE TABLE IF NOT EXISTS "public"."incoming_webhook_keys" (
 ALTER TABLE "public"."incoming_webhook_keys" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."lead_status_history" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "lead_id" "uuid" NOT NULL,
+    "old_status" "text",
+    "new_status" "text" NOT NULL,
+    "changed_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "is_backfilled" boolean DEFAULT false NOT NULL
+);
+
+
+ALTER TABLE "public"."lead_status_history" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."leads" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "client_id" "uuid" NOT NULL,
@@ -816,7 +888,8 @@ CREATE TABLE IF NOT EXISTS "public"."leads" (
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "business_id" "uuid",
     "status_updated_at" timestamp with time zone,
-    "additional_details" "text" DEFAULT ''::"text"
+    "additional_details" "text" DEFAULT ''::"text",
+    "deal_amount" numeric(12,2)
 );
 
 ALTER TABLE ONLY "public"."leads" REPLICA IDENTITY FULL;
@@ -1204,6 +1277,16 @@ ALTER TABLE ONLY "public"."incoming_webhook_keys"
 
 
 
+ALTER TABLE ONLY "public"."lead_status_history"
+    ADD CONSTRAINT "lead_status_history_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE "public"."leads"
+    ADD CONSTRAINT "leads_deal_amount_required_on_close" CHECK ((("status" <> 'נסגר'::"text") OR ("deal_amount" IS NOT NULL))) NOT VALID;
+
+
+
 ALTER TABLE ONLY "public"."leads"
     ADD CONSTRAINT "leads_pkey" PRIMARY KEY ("id");
 
@@ -1344,6 +1427,10 @@ CREATE INDEX "idx_webhook_logs_key_id" ON "public"."webhook_logs" USING "btree" 
 
 
 
+CREATE INDEX "lead_status_history_lead_id_idx" ON "public"."lead_status_history" USING "btree" ("lead_id", "changed_at");
+
+
+
 CREATE INDEX "outgoing_webhook_attempts_created_idx" ON "public"."outgoing_webhook_attempts" USING "btree" ("created_at" DESC);
 
 
@@ -1368,11 +1455,23 @@ CREATE OR REPLACE TRIGGER "trg_cleanup_client_employee_user" AFTER DELETE ON "pu
 
 
 
+CREATE OR REPLACE TRIGGER "trg_clear_health_status_on_deactivate" BEFORE UPDATE OF "status" ON "public"."clients" FOR EACH ROW EXECUTE FUNCTION "public"."clear_health_status_on_deactivate"();
+
+
+
 CREATE OR REPLACE TRIGGER "trg_client_employees_updated_at" BEFORE UPDATE ON "public"."client_employees" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
 
 CREATE OR REPLACE TRIGGER "trg_disable_webhooks_on_client_inactive" AFTER UPDATE OF "status" ON "public"."clients" FOR EACH ROW EXECUTE FUNCTION "public"."disable_webhooks_on_client_inactive"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_record_lead_status_change_insert" AFTER INSERT ON "public"."leads" FOR EACH ROW EXECUTE FUNCTION "public"."record_lead_status_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_record_lead_status_change_update" AFTER UPDATE OF "status" ON "public"."leads" FOR EACH ROW EXECUTE FUNCTION "public"."record_lead_status_change"();
 
 
 
@@ -1570,6 +1669,11 @@ ALTER TABLE ONLY "public"."incoming_webhook_keys"
 
 ALTER TABLE ONLY "public"."incoming_webhook_keys"
     ADD CONSTRAINT "incoming_webhook_keys_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."lead_status_history"
+    ADD CONSTRAINT "lead_status_history_lead_id_fkey" FOREIGN KEY ("lead_id") REFERENCES "public"."leads"("id") ON DELETE CASCADE;
 
 
 
@@ -2103,6 +2207,12 @@ CREATE POLICY "Users can update own profile" ON "public"."profiles" FOR UPDATE T
 
 
 
+CREATE POLICY "Users can view lead status history for visible leads" ON "public"."lead_status_history" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
+   FROM "public"."leads"
+  WHERE ("leads"."id" = "lead_status_history"."lead_id"))));
+
+
+
 CREATE POLICY "Users can view own profile" ON "public"."profiles" FOR SELECT TO "authenticated" USING (("auth"."uid"() = "user_id"));
 
 
@@ -2167,6 +2277,9 @@ ALTER TABLE "public"."incoming_call_webhook_keys" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."incoming_webhook_keys" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."lead_status_history" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."leads" ENABLE ROW LEVEL SECURITY;
@@ -2544,6 +2657,12 @@ GRANT ALL ON FUNCTION "public"."cleanup_client_employee_user"() TO "service_role
 
 
 
+GRANT ALL ON FUNCTION "public"."clear_health_status_on_deactivate"() TO "anon";
+GRANT ALL ON FUNCTION "public"."clear_health_status_on_deactivate"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."clear_health_status_on_deactivate"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."client_has_active_call_webhook"("_business_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."client_has_active_call_webhook"("_business_id" "uuid") TO "service_role";
 
@@ -2600,6 +2719,12 @@ GRANT ALL ON FUNCTION "public"."has_role"("_user_id" "uuid", "_role" "public"."a
 
 GRANT ALL ON FUNCTION "public"."is_client_employee"("_user_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."is_client_employee"("_user_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."record_lead_status_change"() TO "anon";
+GRANT ALL ON FUNCTION "public"."record_lead_status_change"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."record_lead_status_change"() TO "service_role";
 
 
 
@@ -2764,6 +2889,12 @@ GRANT ALL ON TABLE "public"."incoming_call_webhook_keys" TO "service_role";
 GRANT ALL ON TABLE "public"."incoming_webhook_keys" TO "anon";
 GRANT ALL ON TABLE "public"."incoming_webhook_keys" TO "authenticated";
 GRANT ALL ON TABLE "public"."incoming_webhook_keys" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."lead_status_history" TO "anon";
+GRANT ALL ON TABLE "public"."lead_status_history" TO "authenticated";
+GRANT ALL ON TABLE "public"."lead_status_history" TO "service_role";
 
 
 
