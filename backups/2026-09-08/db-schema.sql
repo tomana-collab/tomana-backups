@@ -71,6 +71,78 @@ CREATE TYPE "public"."app_role" AS ENUM (
 ALTER TYPE "public"."app_role" OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."admin_get_staff_allowed_business_ids"("_target_user_id" "uuid") RETURNS "uuid"[]
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF NOT public.has_role(auth.uid(), 'admin'::app_role) THEN
+    RETURN '{}'::uuid[];
+  END IF;
+
+  RETURN COALESCE((
+    SELECT ARRAY_AGG(DISTINCT bid) FROM (
+      SELECT business_id AS bid FROM public.staff_assignments
+        WHERE staff_user_id = _target_user_id AND business_id IS NOT NULL
+      UNION
+      SELECT b.id AS bid FROM public.businesses b
+        WHERE b.client_id = ANY(public.admin_get_staff_allowed_client_ids(_target_user_id))
+    ) x
+  ), '{}');
+END$$;
+
+
+ALTER FUNCTION "public"."admin_get_staff_allowed_business_ids"("_target_user_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."admin_get_staff_allowed_client_ids"("_target_user_id" "uuid") RETURNS "uuid"[]
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF NOT public.has_role(auth.uid(), 'admin'::app_role) THEN
+    RETURN '{}'::uuid[];
+  END IF;
+
+  RETURN COALESCE((
+    SELECT ARRAY_AGG(DISTINCT cid) FROM (
+      SELECT client_id AS cid FROM public.staff_assignments
+        WHERE staff_user_id = _target_user_id AND client_id IS NOT NULL
+      UNION
+      SELECT b.client_id AS cid FROM public.staff_assignments sa
+        JOIN public.businesses b ON b.id = sa.business_id
+        WHERE sa.staff_user_id = _target_user_id AND sa.business_id IS NOT NULL
+    ) x
+  ), '{}');
+END$$;
+
+
+ALTER FUNCTION "public"."admin_get_staff_allowed_client_ids"("_target_user_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."admin_get_staff_allowed_platforms"("_target_user_id" "uuid", "_business_id" "uuid") RETURNS "text"[]
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  _platforms text[];
+BEGIN
+  IF NOT public.has_role(auth.uid(), 'admin'::app_role) THEN
+    RETURN '{}'::text[];
+  END IF;
+
+  SELECT allowed_platforms INTO _platforms
+  FROM public.staff_assignments
+  WHERE staff_user_id = _target_user_id AND business_id = _business_id
+  LIMIT 1;
+
+  RETURN _platforms; -- NULL = ללא הגבלת פלטפורמה עבור אותו עסק
+END$$;
+
+
+ALTER FUNCTION "public"."admin_get_staff_allowed_platforms"("_target_user_id" "uuid", "_business_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."auto_create_lead_from_call"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -141,13 +213,79 @@ CREATE OR REPLACE FUNCTION "public"."can_access_business"("_user_id" "uuid", "_b
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  SELECT public.has_role(_user_id, 'admin'::app_role)
-      OR public.has_role(_user_id, 'employee'::app_role)
-      OR (_business_id IS NOT NULL AND _business_id = ANY(public.get_allowed_business_ids(_user_id)))
+  SELECT _user_id = auth.uid() AND (
+    public.has_role(_user_id, 'admin'::app_role)
+    OR public.has_role(_user_id, 'employee'::app_role)
+    OR (_business_id IS NOT NULL AND _business_id = ANY(public.get_allowed_business_ids(_user_id)))
+  )
 $$;
 
 
 ALTER FUNCTION "public"."can_access_business"("_user_id" "uuid", "_business_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."check_and_increment_call_webhook_rate_limit"("_webhook_key_id" "uuid", "_limit" integer, "_window_ms" bigint) RETURNS TABLE("allowed" boolean, "retry_after_seconds" integer)
+    LANGUAGE "plpgsql"
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  _now timestamptz := clock_timestamp();
+  _result record;
+BEGIN
+  INSERT INTO public.call_webhook_rate_limits AS t (webhook_key_id, window_start, request_count, updated_at)
+  VALUES (_webhook_key_id, _now, 1, _now)
+  ON CONFLICT (webhook_key_id) DO UPDATE SET
+    window_start = CASE WHEN _now - t.window_start >= (_window_ms || ' milliseconds')::interval THEN _now ELSE t.window_start END,
+    request_count = CASE WHEN _now - t.window_start >= (_window_ms || ' milliseconds')::interval THEN 1 ELSE t.request_count + 1 END,
+    updated_at = _now
+  WHERE (_now - t.window_start >= (_window_ms || ' milliseconds')::interval) OR (t.request_count < _limit)
+  RETURNING window_start, request_count INTO _result;
+
+  IF _result IS NULL THEN
+    SELECT window_start, request_count INTO _result FROM public.call_webhook_rate_limits WHERE webhook_key_id = _webhook_key_id;
+    RETURN QUERY SELECT false,
+      GREATEST(1, CEIL(EXTRACT(EPOCH FROM ((_result.window_start + (_window_ms || ' milliseconds')::interval) - _now))))::int;
+    RETURN;
+  END IF;
+
+  RETURN QUERY SELECT true, 0;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."check_and_increment_call_webhook_rate_limit"("_webhook_key_id" "uuid", "_limit" integer, "_window_ms" bigint) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."check_and_increment_webhook_rate_limit"("_webhook_key_id" "uuid", "_limit" integer, "_window_ms" bigint) RETURNS TABLE("allowed" boolean, "retry_after_seconds" integer)
+    LANGUAGE "plpgsql"
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  _now timestamptz := clock_timestamp();
+  _result record;
+BEGIN
+  INSERT INTO public.webhook_rate_limits AS t (webhook_key_id, window_start, request_count, updated_at)
+  VALUES (_webhook_key_id, _now, 1, _now)
+  ON CONFLICT (webhook_key_id) DO UPDATE SET
+    window_start = CASE WHEN _now - t.window_start >= (_window_ms || ' milliseconds')::interval THEN _now ELSE t.window_start END,
+    request_count = CASE WHEN _now - t.window_start >= (_window_ms || ' milliseconds')::interval THEN 1 ELSE t.request_count + 1 END,
+    updated_at = _now
+  WHERE (_now - t.window_start >= (_window_ms || ' milliseconds')::interval) OR (t.request_count < _limit)
+  RETURNING window_start, request_count INTO _result;
+
+  IF _result IS NULL THEN
+    SELECT window_start, request_count INTO _result FROM public.webhook_rate_limits WHERE webhook_key_id = _webhook_key_id;
+    RETURN QUERY SELECT false,
+      GREATEST(1, CEIL(EXTRACT(EPOCH FROM ((_result.window_start + (_window_ms || ' milliseconds')::interval) - _now))))::int;
+    RETURN;
+  END IF;
+
+  RETURN QUERY SELECT true, 0;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."check_and_increment_webhook_rate_limit"("_webhook_key_id" "uuid", "_limit" integer, "_window_ms" bigint) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."cleanup_client_employee_user"() RETURNS "trigger"
@@ -173,11 +311,9 @@ CREATE OR REPLACE FUNCTION "public"."clear_health_status_on_deactivate"() RETURN
     SET "search_path" TO 'public'
     AS $$
 BEGIN
-  -- health_status/health_reasons הן NOT NULL (ברירת המחדל 'ok'/'{}') - אז
-  -- "ניקוי" כאן אומר איפוס לברירת המחדל הנייטרלית, לא NULL
   IF NEW.status <> 'פעיל' THEN
     NEW.health_status := 'ok';
-    NEW.health_reasons := '{}';
+    NEW.health_reasons := '[]'::jsonb;
   END IF;
   RETURN NEW;
 END;
@@ -203,7 +339,7 @@ CREATE OR REPLACE FUNCTION "public"."client_has_active_call_webhook"("_business_
         OR (
           public.is_client_employee(auth.uid())
           AND k.client_id = public.get_owner_client_id(auth.uid())
-          AND (_business_id IS NULL OR k.business_id = ANY(public.get_allowed_business_ids(auth.uid())))
+          AND k.business_id = ANY(public.get_allowed_business_ids(auth.uid()))
         )
       )
   );
@@ -243,6 +379,10 @@ DECLARE
   _client_id uuid;
   _employee_bids uuid[];
 BEGIN
+  IF _user_id IS DISTINCT FROM auth.uid() THEN
+    RETURN '{}'::uuid[];
+  END IF;
+
   SELECT id INTO _client_id FROM public.clients WHERE user_id = _user_id LIMIT 1;
   IF _client_id IS NOT NULL THEN
     RETURN COALESCE(ARRAY(SELECT id FROM public.businesses WHERE client_id = _client_id), '{}');
@@ -262,6 +402,25 @@ END$$;
 
 
 ALTER FUNCTION "public"."get_allowed_business_ids"("_user_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_freelancer_names"("_user_ids" "uuid"[] DEFAULT NULL::"uuid"[]) RETURNS TABLE("user_id" "uuid", "full_name" "text")
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT p.user_id, p.full_name
+  FROM public.profiles p
+  JOIN public.user_roles ur ON ur.user_id = p.user_id AND ur.role = 'freelancer'
+  WHERE (
+    public.has_role(auth.uid(), 'freelancer'::public.app_role)
+    OR public.has_role(auth.uid(), 'admin'::public.app_role)
+    OR public.has_role(auth.uid(), 'employee'::public.app_role)
+  )
+  AND (_user_ids IS NULL OR p.user_id = ANY(_user_ids));
+$$;
+
+
+ALTER FUNCTION "public"."get_freelancer_names"("_user_ids" "uuid"[]) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_freelancer_task_entities"("_task_ids" "uuid"[]) RETURNS TABLE("task_id" "uuid", "client_name" "text", "business_name" "text")
@@ -291,10 +450,11 @@ CREATE OR REPLACE FUNCTION "public"."get_owner_client_id"("_user_id" "uuid") RET
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  SELECT c.id FROM public.clients c WHERE c.user_id = _user_id AND c.status = 'פעיל'
+  SELECT c.id FROM public.clients c
+  WHERE _user_id = auth.uid() AND c.user_id = _user_id AND c.status = 'פעיל'
   UNION ALL
   SELECT c.id FROM public.client_employees ce JOIN public.clients c ON c.id = ce.client_id
-  WHERE ce.user_id = _user_id AND c.status = 'פעיל'
+  WHERE _user_id = auth.uid() AND ce.user_id = _user_id AND c.status = 'פעיל'
   LIMIT 1
 $$;
 
@@ -330,6 +490,84 @@ $$;
 
 
 ALTER FUNCTION "public"."get_safe_team_details"("_user_ids" "uuid"[]) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_staff_allowed_business_ids"("_user_id" "uuid") RETURNS "uuid"[]
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT CASE
+    WHEN _user_id IS DISTINCT FROM auth.uid() THEN '{}'::uuid[]
+    WHEN public.has_role(_user_id, 'admin'::app_role) THEN
+      COALESCE(ARRAY(SELECT id FROM public.businesses), '{}')
+    ELSE
+      COALESCE((
+        SELECT ARRAY_AGG(DISTINCT bid) FROM (
+          SELECT business_id AS bid FROM public.staff_assignments
+            WHERE staff_user_id = _user_id AND business_id IS NOT NULL
+          UNION
+          SELECT b.id AS bid FROM public.businesses b
+            WHERE b.client_id = ANY(public.get_staff_allowed_client_ids(_user_id))
+        ) x
+      ), '{}')
+  END
+$$;
+
+
+ALTER FUNCTION "public"."get_staff_allowed_business_ids"("_user_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_staff_allowed_client_ids"("_user_id" "uuid") RETURNS "uuid"[]
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT CASE
+    WHEN _user_id IS DISTINCT FROM auth.uid() THEN '{}'::uuid[]
+    WHEN public.has_role(_user_id, 'admin'::app_role) THEN
+      COALESCE(ARRAY(SELECT id FROM public.clients), '{}')
+    ELSE
+      COALESCE((
+        SELECT ARRAY_AGG(DISTINCT cid) FROM (
+          SELECT client_id AS cid FROM public.staff_assignments
+            WHERE staff_user_id = _user_id AND client_id IS NOT NULL
+          UNION
+          SELECT b.client_id AS cid FROM public.staff_assignments sa
+            JOIN public.businesses b ON b.id = sa.business_id
+            WHERE sa.staff_user_id = _user_id AND sa.business_id IS NOT NULL
+        ) x
+      ), '{}')
+  END
+$$;
+
+
+ALTER FUNCTION "public"."get_staff_allowed_client_ids"("_user_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_staff_allowed_platforms"("_user_id" "uuid", "_business_id" "uuid") RETURNS "text"[]
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  _platforms text[];
+BEGIN
+  IF _user_id IS DISTINCT FROM auth.uid() THEN
+    RETURN '{}'::text[]; -- ריק = לא רואה כלום, בניגוד ל-NULL שמשמעו "ללא הגבלה"
+  END IF;
+
+  IF public.has_role(_user_id, 'admin'::app_role) THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT allowed_platforms INTO _platforms
+  FROM public.staff_assignments
+  WHERE staff_user_id = _user_id AND business_id = _business_id
+  LIMIT 1;
+
+  RETURN _platforms;
+END$$;
+
+
+ALTER FUNCTION "public"."get_staff_allowed_platforms"("_user_id" "uuid", "_business_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_team_member_position"("_user_id" "uuid") RETURNS TABLE("member_position" "text", "member_specialization" "text", "member_status" "text")
@@ -369,11 +607,28 @@ $$;
 ALTER FUNCTION "public"."handle_new_user"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."has_portal_permission"("_user_id" "uuid", "_screen" "text", "_mode" "text" DEFAULT 'view'::"text") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT _user_id IS NOT DISTINCT FROM auth.uid()
+    AND COALESCE(
+      (SELECT (permissions -> _screen ->> _mode)::boolean
+       FROM public.client_employees
+       WHERE user_id = _user_id),
+      false
+    )
+$$;
+
+
+ALTER FUNCTION "public"."has_portal_permission"("_user_id" "uuid", "_screen" "text", "_mode" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."has_role"("_user_id" "uuid", "_role" "public"."app_role") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  SELECT EXISTS (
+  SELECT _user_id = auth.uid() AND EXISTS (
     SELECT 1 FROM public.user_roles WHERE user_id = _user_id AND role = _role
   )
 $$;
@@ -386,11 +641,43 @@ CREATE OR REPLACE FUNCTION "public"."is_client_employee"("_user_id" "uuid") RETU
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  SELECT EXISTS (SELECT 1 FROM public.client_employees WHERE user_id = _user_id)
+  SELECT _user_id = auth.uid() AND EXISTS (
+    SELECT 1 FROM public.client_employees WHERE user_id = _user_id
+  )
 $$;
 
 
 ALTER FUNCTION "public"."is_client_employee"("_user_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."is_staff_assigned_to_business"("_user_id" "uuid", "_business_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT _user_id IS NOT DISTINCT FROM auth.uid()
+    AND (
+      public.has_role(_user_id, 'admin'::app_role)
+      OR (_business_id IS NOT NULL AND _business_id = ANY(public.get_staff_allowed_business_ids(_user_id)))
+    )
+$$;
+
+
+ALTER FUNCTION "public"."is_staff_assigned_to_business"("_user_id" "uuid", "_business_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."is_staff_assigned_to_client"("_user_id" "uuid", "_client_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT _user_id IS NOT DISTINCT FROM auth.uid()
+    AND (
+      public.has_role(_user_id, 'admin'::app_role)
+      OR (_client_id IS NOT NULL AND _client_id = ANY(public.get_staff_allowed_client_ids(_user_id)))
+    )
+$$;
+
+
+ALTER FUNCTION "public"."is_staff_assigned_to_client"("_user_id" "uuid", "_client_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."record_lead_status_change"() RETURNS "trigger"
@@ -577,6 +864,52 @@ CREATE TABLE IF NOT EXISTS "public"."agency_settings" (
 ALTER TABLE "public"."agency_settings" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."business_competitors" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "business_id" "uuid" NOT NULL,
+    "name" "text" DEFAULT ''::"text" NOT NULL,
+    "url" "text" DEFAULT ''::"text" NOT NULL,
+    "last_insight" "text" DEFAULT ''::"text" NOT NULL,
+    "checked_at" "date",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."business_competitors" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."business_goals" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "business_id" "uuid" NOT NULL,
+    "client_id" "uuid" NOT NULL,
+    "goal_name" "text" DEFAULT ''::"text" NOT NULL,
+    "goal_type" "text" DEFAULT 'אחר'::"text" NOT NULL,
+    "kpi_name" "text" DEFAULT ''::"text" NOT NULL,
+    "kpi_unit" "text" DEFAULT ''::"text" NOT NULL,
+    "baseline_value" numeric,
+    "target_value" numeric,
+    "current_value" numeric DEFAULT 0 NOT NULL,
+    "start_date" "date",
+    "target_date" "date",
+    "forecast_value" numeric,
+    "status_color" "text" DEFAULT 'אין_מידע'::"text" NOT NULL,
+    "owner_user_id" "uuid",
+    "next_action" "text" DEFAULT ''::"text" NOT NULL,
+    "result_outcome" "text",
+    "conclusion" "text" DEFAULT ''::"text" NOT NULL,
+    "transition_condition" "text" DEFAULT ''::"text" NOT NULL,
+    "is_active" boolean DEFAULT true NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+ALTER TABLE ONLY "public"."business_goals" REPLICA IDENTITY FULL;
+
+
+ALTER TABLE "public"."business_goals" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."business_metrics" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "business_id" "uuid" NOT NULL,
@@ -595,7 +928,11 @@ CREATE TABLE IF NOT EXISTS "public"."business_metrics" (
     "notes" "text" DEFAULT ''::"text",
     "created_at" timestamp with time zone DEFAULT "now"(),
     "updated_at" timestamp with time zone DEFAULT "now"(),
-    "ctr" numeric(10,4) DEFAULT 0
+    "ctr" numeric(10,4) DEFAULT 0,
+    "initiative_id" "uuid",
+    "data_quality_note" "text" DEFAULT ''::"text" NOT NULL,
+    "engagement_count" integer,
+    "contact_actions" integer
 );
 
 ALTER TABLE ONLY "public"."business_metrics" REPLICA IDENTITY FULL;
@@ -604,20 +941,31 @@ ALTER TABLE ONLY "public"."business_metrics" REPLICA IDENTITY FULL;
 ALTER TABLE "public"."business_metrics" OWNER TO "postgres";
 
 
-CREATE TABLE IF NOT EXISTS "public"."business_targets" (
+COMMENT ON COLUMN "public"."business_metrics"."engagement_count" IS 'מעורבות (לייקים/שיתופים/תגובות) - עבור לקוחות מסוג חשיפה ומודעות';
+
+
+
+COMMENT ON COLUMN "public"."business_metrics"."contact_actions" IS 'פניות ליצירת קשר - עבור לקוחות מסוג חשיפה ומודעות';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."business_service_items" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "business_id" "uuid" NOT NULL,
     "client_id" "uuid" NOT NULL,
-    "month" "text" NOT NULL,
-    "target_leads" integer DEFAULT 0,
-    "target_sales" integer DEFAULT 0,
-    "target_revenue" numeric DEFAULT 0,
+    "service_type" "text" DEFAULT 'אחר'::"text" NOT NULL,
+    "description" "text" DEFAULT ''::"text" NOT NULL,
+    "quantity" numeric,
+    "unit" "text",
+    "platform" "text",
+    "is_active" boolean DEFAULT true NOT NULL,
+    "notes" "text" DEFAULT ''::"text" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
 );
 
 
-ALTER TABLE "public"."business_targets" OWNER TO "postgres";
+ALTER TABLE "public"."business_service_items" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."businesses" (
@@ -632,7 +980,21 @@ CREATE TABLE IF NOT EXISTS "public"."businesses" (
     "email" "text" DEFAULT ''::"text" NOT NULL,
     "phone" "text",
     "address" "text",
-    "ad_platforms" "text"[] DEFAULT '{}'::"text"[] NOT NULL
+    "ad_platforms" "text"[] DEFAULT '{}'::"text"[] NOT NULL,
+    "growth_stage" "text" DEFAULT ''::"text" NOT NULL,
+    "business_description" "text" DEFAULT ''::"text" NOT NULL,
+    "core_services" "text" DEFAULT ''::"text" NOT NULL,
+    "core_audience" "text" DEFAULT ''::"text" NOT NULL,
+    "differentiation_promise" "text" DEFAULT ''::"text" NOT NULL,
+    "key_message" "text" DEFAULT ''::"text" NOT NULL,
+    "owner_priorities" "text" DEFAULT ''::"text" NOT NULL,
+    "sales_process" "text" DEFAULT ''::"text" NOT NULL,
+    "monthly_capacity" "text" DEFAULT ''::"text" NOT NULL,
+    "regular_media_budget" numeric DEFAULT 0 NOT NULL,
+    "next_key_action" "text" DEFAULT ''::"text" NOT NULL,
+    "client_status_color" "text" DEFAULT 'אין_מידע'::"text" NOT NULL,
+    "last_strategy_review_date" "date",
+    "next_strategy_review_date" "date"
 );
 
 ALTER TABLE ONLY "public"."businesses" REPLICA IDENTITY FULL;
@@ -690,6 +1052,25 @@ ALTER TABLE ONLY "public"."calls" REPLICA IDENTITY FULL;
 ALTER TABLE "public"."calls" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."client_ad_accounts" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "business_id" "uuid" NOT NULL,
+    "client_id" "uuid" NOT NULL,
+    "platform" "text" DEFAULT 'Meta'::"text" NOT NULL,
+    "ad_account_id" "text" NOT NULL,
+    "account_name" "text",
+    "is_active" boolean DEFAULT true NOT NULL,
+    "last_synced_at" timestamp with time zone,
+    "last_sync_status" "text",
+    "last_sync_error" "text",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"()
+);
+
+
+ALTER TABLE "public"."client_ad_accounts" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."client_employees" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "client_id" "uuid" NOT NULL,
@@ -706,6 +1087,35 @@ CREATE TABLE IF NOT EXISTS "public"."client_employees" (
 ALTER TABLE "public"."client_employees" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."client_updates" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "business_id" "uuid" NOT NULL,
+    "client_id" "uuid" NOT NULL,
+    "source_record_type" "text",
+    "source_record_id" "uuid",
+    "update_type" "text" DEFAULT 'מיידי'::"text" NOT NULL,
+    "subject" "text" DEFAULT ''::"text" NOT NULL,
+    "internal_copy" "text" DEFAULT ''::"text" NOT NULL,
+    "approved_client_copy" "text" DEFAULT ''::"text" NOT NULL,
+    "channel" "text" DEFAULT 'אחר'::"text" NOT NULL,
+    "approval_status" "text" DEFAULT 'טיוטה'::"text" NOT NULL,
+    "send_status" "text" DEFAULT 'לא_מוכן'::"text" NOT NULL,
+    "approver_id" "uuid",
+    "approved_at" timestamp with time zone,
+    "sent_at" timestamp with time zone,
+    "external_message_id" "text",
+    "send_error" "text",
+    "idempotency_key" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+ALTER TABLE ONLY "public"."client_updates" REPLICA IDENTITY FULL;
+
+
+ALTER TABLE "public"."client_updates" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."clients" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "user_id" "uuid",
@@ -718,7 +1128,7 @@ CREATE TABLE IF NOT EXISTS "public"."clients" (
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "client_type" "text" DEFAULT 'שירות'::"text" NOT NULL,
     "health_status" "text" DEFAULT 'ok'::"text" NOT NULL,
-    "health_reasons" "text"[] DEFAULT '{}'::"text"[] NOT NULL,
+    "health_reasons" "jsonb" DEFAULT '[]'::"jsonb" NOT NULL,
     "health_checked_at" timestamp with time zone,
     "health_alerted_at" timestamp with time zone
 );
@@ -751,7 +1161,8 @@ CREATE TABLE IF NOT EXISTS "public"."documents" (
     "uploaded_by" "uuid",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "category" "text",
-    "business_id" "uuid"
+    "business_id" "uuid",
+    "visible_to_freelancers" boolean DEFAULT true NOT NULL
 );
 
 
@@ -828,6 +1239,48 @@ ALTER TABLE ONLY "public"."freelancer_tasks" REPLICA IDENTITY FULL;
 ALTER TABLE "public"."freelancer_tasks" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."google_ads_metrics" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "business_id" "uuid" NOT NULL,
+    "client_id" "uuid" NOT NULL,
+    "ad_account_id" "text" NOT NULL,
+    "date" "date" NOT NULL,
+    "campaign_id" "text",
+    "campaign_name" "text",
+    "cost" numeric DEFAULT 0,
+    "impressions" integer DEFAULT 0,
+    "clicks" integer DEFAULT 0,
+    "ctr" numeric DEFAULT 0,
+    "conversions" numeric DEFAULT 0,
+    "conversions_value" numeric DEFAULT 0,
+    "raw" "jsonb",
+    "synced_at" timestamp with time zone DEFAULT "now"(),
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"()
+);
+
+
+ALTER TABLE "public"."google_ads_metrics" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."google_ads_sync_log" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "started_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "finished_at" timestamp with time zone,
+    "triggered_by" "text" DEFAULT 'cron'::"text" NOT NULL,
+    "triggered_by_user_id" "uuid",
+    "status" "text" DEFAULT 'ok'::"text" NOT NULL,
+    "accounts_total" integer DEFAULT 0 NOT NULL,
+    "accounts_ok" integer DEFAULT 0 NOT NULL,
+    "accounts_error" integer DEFAULT 0 NOT NULL,
+    "error" "text",
+    "details" "jsonb"
+);
+
+
+ALTER TABLE "public"."google_ads_sync_log" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."incoming_call_webhook_keys" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "token" "text" DEFAULT "encode"("extensions"."gen_random_bytes"(24), 'hex'::"text") NOT NULL,
@@ -898,6 +1351,37 @@ ALTER TABLE ONLY "public"."leads" REPLICA IDENTITY FULL;
 ALTER TABLE "public"."leads" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."marketing_initiatives" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "business_id" "uuid" NOT NULL,
+    "client_id" "uuid" NOT NULL,
+    "goal_id" "uuid",
+    "monthly_cycle_id" "uuid",
+    "name" "text" DEFAULT ''::"text" NOT NULL,
+    "rationale" "text" DEFAULT ''::"text" NOT NULL,
+    "target_audience" "text" DEFAULT ''::"text" NOT NULL,
+    "service_or_offer" "text" DEFAULT ''::"text" NOT NULL,
+    "channels" "text"[] DEFAULT '{}'::"text"[] NOT NULL,
+    "planned_budget" numeric,
+    "kpi_name" "text" DEFAULT ''::"text" NOT NULL,
+    "kpi_target" numeric,
+    "kpi_result" numeric,
+    "status" "text" DEFAULT 'רעיון'::"text" NOT NULL,
+    "conclusion" "text" DEFAULT ''::"text" NOT NULL,
+    "decision" "text",
+    "next_action" "text" DEFAULT ''::"text" NOT NULL,
+    "external_ad_account_id" "text" DEFAULT ''::"text" NOT NULL,
+    "external_campaign_id" "text" DEFAULT ''::"text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+ALTER TABLE ONLY "public"."marketing_initiatives" REPLICA IDENTITY FULL;
+
+
+ALTER TABLE "public"."marketing_initiatives" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."messages" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "client_id" "uuid" NOT NULL,
@@ -911,6 +1395,83 @@ ALTER TABLE ONLY "public"."messages" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."messages" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."meta_ads_metrics" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "business_id" "uuid" NOT NULL,
+    "client_id" "uuid" NOT NULL,
+    "ad_account_id" "text" NOT NULL,
+    "date" "date" NOT NULL,
+    "campaign_id" "text",
+    "campaign_name" "text",
+    "spend" numeric DEFAULT 0,
+    "impressions" integer DEFAULT 0,
+    "clicks" integer DEFAULT 0,
+    "ctr" numeric DEFAULT 0,
+    "cpc" numeric DEFAULT 0,
+    "reach" integer DEFAULT 0,
+    "leads_count" integer DEFAULT 0,
+    "raw" "jsonb",
+    "synced_at" timestamp with time zone DEFAULT "now"(),
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "engagement_count" integer DEFAULT 0,
+    "contact_actions" integer DEFAULT 0,
+    "purchases" integer DEFAULT 0,
+    "purchase_value" numeric DEFAULT 0
+);
+
+
+ALTER TABLE "public"."meta_ads_metrics" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."meta_ads_sync_log" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "started_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "finished_at" timestamp with time zone,
+    "triggered_by" "text" DEFAULT 'cron'::"text" NOT NULL,
+    "triggered_by_user_id" "uuid",
+    "status" "text" DEFAULT 'ok'::"text" NOT NULL,
+    "accounts_total" integer DEFAULT 0 NOT NULL,
+    "accounts_ok" integer DEFAULT 0 NOT NULL,
+    "accounts_error" integer DEFAULT 0 NOT NULL,
+    "error" "text",
+    "details" "jsonb"
+);
+
+
+ALTER TABLE "public"."meta_ads_sync_log" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."monthly_cycles" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "business_id" "uuid" NOT NULL,
+    "client_id" "uuid" NOT NULL,
+    "month" "text" NOT NULL,
+    "planned_budget" numeric,
+    "planned_goals_note" "text" DEFAULT ''::"text" NOT NULL,
+    "actual_spend" numeric,
+    "spend_forecast" numeric,
+    "main_actual_result" "text" DEFAULT ''::"text" NOT NULL,
+    "execution_status" "text" DEFAULT 'תכנון'::"text" NOT NULL,
+    "main_gap" "text" DEFAULT ''::"text" NOT NULL,
+    "next_action" "text" DEFAULT ''::"text" NOT NULL,
+    "what_worked" "text" DEFAULT ''::"text" NOT NULL,
+    "what_didnt_work" "text" DEFAULT ''::"text" NOT NULL,
+    "what_we_learned" "text" DEFAULT ''::"text" NOT NULL,
+    "decision" "text",
+    "client_advanced_stage" boolean,
+    "next_month_recommendation" "text" DEFAULT ''::"text" NOT NULL,
+    "proposed_next_goals" "text" DEFAULT ''::"text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+ALTER TABLE ONLY "public"."monthly_cycles" REPLICA IDENTITY FULL;
+
+
+ALTER TABLE "public"."monthly_cycles" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."outgoing_webhook_attempts" (
@@ -1047,6 +1608,41 @@ ALTER TABLE ONLY "public"."requests" REPLICA IDENTITY FULL;
 ALTER TABLE "public"."requests" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."staff_activity_log" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "staff_user_id" "uuid" NOT NULL,
+    "business_id" "uuid",
+    "client_id" "uuid",
+    "action_type" "text" NOT NULL,
+    "entity_type" "text" NOT NULL,
+    "entity_id" "uuid",
+    "summary" "text" DEFAULT ''::"text" NOT NULL,
+    "details" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."staff_activity_log" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."staff_assignments" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "staff_user_id" "uuid" NOT NULL,
+    "client_id" "uuid",
+    "business_id" "uuid",
+    "allowed_platforms" "text"[],
+    "is_primary" boolean DEFAULT false NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "staff_assignments_exactly_one_scope" CHECK (((("client_id" IS NOT NULL) AND ("business_id" IS NULL)) OR (("client_id" IS NULL) AND ("business_id" IS NOT NULL)))),
+    CONSTRAINT "staff_assignments_platforms_only_on_business" CHECK ((("allowed_platforms" IS NULL) OR ("business_id" IS NOT NULL)))
+);
+
+ALTER TABLE ONLY "public"."staff_assignments" REPLICA IDENTITY FULL;
+
+
+ALTER TABLE "public"."staff_assignments" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."team_details" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "user_id" "uuid" NOT NULL,
@@ -1070,7 +1666,8 @@ CREATE TABLE IF NOT EXISTS "public"."team_details" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "status" "text" DEFAULT 'פעיל'::"text" NOT NULL,
-    "use_employee_dashboard" boolean DEFAULT false NOT NULL
+    "use_employee_dashboard" boolean DEFAULT false NOT NULL,
+    "autonomy_level" "text" DEFAULT 'בפיקוח'::"text" NOT NULL
 );
 
 
@@ -1152,6 +1749,38 @@ CREATE TABLE IF NOT EXISTS "public"."webhook_rate_limits" (
 ALTER TABLE "public"."webhook_rate_limits" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."work_items" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "business_id" "uuid" NOT NULL,
+    "client_id" "uuid" NOT NULL,
+    "goal_id" "uuid",
+    "initiative_id" "uuid",
+    "record_type" "text" DEFAULT 'task'::"text" NOT NULL,
+    "title" "text" DEFAULT ''::"text" NOT NULL,
+    "body" "text" DEFAULT ''::"text" NOT NULL,
+    "why_it_matters" "text" DEFAULT ''::"text" NOT NULL,
+    "proposed_action" "text" DEFAULT ''::"text" NOT NULL,
+    "assignee_user_id" "uuid",
+    "due_at" timestamp with time zone,
+    "priority" "text" DEFAULT 'רגילה'::"text" NOT NULL,
+    "status" "text" DEFAULT 'טיוטה'::"text" NOT NULL,
+    "needs_action" boolean DEFAULT false NOT NULL,
+    "needs_manager_decision" boolean DEFAULT false NOT NULL,
+    "client_update_flag" "text" DEFAULT 'none'::"text" NOT NULL,
+    "proposed_client_copy" "text" DEFAULT ''::"text" NOT NULL,
+    "next_action_text" "text" DEFAULT ''::"text" NOT NULL,
+    "escalated_at" timestamp with time zone,
+    "created_by" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+ALTER TABLE ONLY "public"."work_items" REPLICA IDENTITY FULL;
+
+
+ALTER TABLE "public"."work_items" OWNER TO "postgres";
+
+
 ALTER TABLE ONLY "public"."admin_audit_log"
     ADD CONSTRAINT "admin_audit_log_pkey" PRIMARY KEY ("id");
 
@@ -1167,6 +1796,16 @@ ALTER TABLE ONLY "public"."agency_settings"
 
 
 
+ALTER TABLE ONLY "public"."business_competitors"
+    ADD CONSTRAINT "business_competitors_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."business_goals"
+    ADD CONSTRAINT "business_goals_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."business_metrics"
     ADD CONSTRAINT "business_metrics_business_id_month_platform_key" UNIQUE ("business_id", "month", "platform");
 
@@ -1177,13 +1816,8 @@ ALTER TABLE ONLY "public"."business_metrics"
 
 
 
-ALTER TABLE ONLY "public"."business_targets"
-    ADD CONSTRAINT "business_targets_business_id_month_key" UNIQUE ("business_id", "month");
-
-
-
-ALTER TABLE ONLY "public"."business_targets"
-    ADD CONSTRAINT "business_targets_pkey" PRIMARY KEY ("id");
+ALTER TABLE ONLY "public"."business_service_items"
+    ADD CONSTRAINT "business_service_items_pkey" PRIMARY KEY ("id");
 
 
 
@@ -1207,6 +1841,16 @@ ALTER TABLE ONLY "public"."calls"
 
 
 
+ALTER TABLE ONLY "public"."client_ad_accounts"
+    ADD CONSTRAINT "client_ad_accounts_business_id_platform_ad_account_id_key" UNIQUE ("business_id", "platform", "ad_account_id");
+
+
+
+ALTER TABLE ONLY "public"."client_ad_accounts"
+    ADD CONSTRAINT "client_ad_accounts_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."client_employees"
     ADD CONSTRAINT "client_employees_pkey" PRIMARY KEY ("id");
 
@@ -1214,6 +1858,16 @@ ALTER TABLE ONLY "public"."client_employees"
 
 ALTER TABLE ONLY "public"."client_employees"
     ADD CONSTRAINT "client_employees_user_id_key" UNIQUE ("user_id");
+
+
+
+ALTER TABLE ONLY "public"."client_updates"
+    ADD CONSTRAINT "client_updates_idempotency_key_key" UNIQUE ("idempotency_key");
+
+
+
+ALTER TABLE ONLY "public"."client_updates"
+    ADD CONSTRAINT "client_updates_pkey" PRIMARY KEY ("id");
 
 
 
@@ -1257,6 +1911,21 @@ ALTER TABLE ONLY "public"."freelancer_tasks"
 
 
 
+ALTER TABLE ONLY "public"."google_ads_metrics"
+    ADD CONSTRAINT "google_ads_metrics_business_id_ad_account_id_date_campaign__key" UNIQUE ("business_id", "ad_account_id", "date", "campaign_id");
+
+
+
+ALTER TABLE ONLY "public"."google_ads_metrics"
+    ADD CONSTRAINT "google_ads_metrics_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."google_ads_sync_log"
+    ADD CONSTRAINT "google_ads_sync_log_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."incoming_call_webhook_keys"
     ADD CONSTRAINT "incoming_call_webhook_keys_pkey" PRIMARY KEY ("id");
 
@@ -1292,8 +1961,33 @@ ALTER TABLE ONLY "public"."leads"
 
 
 
+ALTER TABLE ONLY "public"."marketing_initiatives"
+    ADD CONSTRAINT "marketing_initiatives_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."messages"
     ADD CONSTRAINT "messages_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."meta_ads_metrics"
+    ADD CONSTRAINT "meta_ads_metrics_business_id_ad_account_id_date_campaign_id_key" UNIQUE ("business_id", "ad_account_id", "date", "campaign_id");
+
+
+
+ALTER TABLE ONLY "public"."meta_ads_metrics"
+    ADD CONSTRAINT "meta_ads_metrics_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."meta_ads_sync_log"
+    ADD CONSTRAINT "meta_ads_sync_log_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."monthly_cycles"
+    ADD CONSTRAINT "monthly_cycles_pkey" PRIMARY KEY ("id");
 
 
 
@@ -1347,6 +2041,16 @@ ALTER TABLE ONLY "public"."requests"
 
 
 
+ALTER TABLE ONLY "public"."staff_activity_log"
+    ADD CONSTRAINT "staff_activity_log_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."staff_assignments"
+    ADD CONSTRAINT "staff_assignments_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."team_details"
     ADD CONSTRAINT "team_details_pkey" PRIMARY KEY ("id");
 
@@ -1354,6 +2058,11 @@ ALTER TABLE ONLY "public"."team_details"
 
 ALTER TABLE ONLY "public"."team_details"
     ADD CONSTRAINT "team_details_user_id_key" UNIQUE ("user_id");
+
+
+
+ALTER TABLE ONLY "public"."monthly_cycles"
+    ADD CONSTRAINT "uq_monthly_cycles_business_month" UNIQUE ("business_id", "month");
 
 
 
@@ -1387,6 +2096,11 @@ ALTER TABLE ONLY "public"."webhook_rate_limits"
 
 
 
+ALTER TABLE ONLY "public"."work_items"
+    ADD CONSTRAINT "work_items_pkey" PRIMARY KEY ("id");
+
+
+
 CREATE INDEX "call_webhook_logs_created_at_idx" ON "public"."call_webhook_logs" USING "btree" ("created_at" DESC);
 
 
@@ -1407,6 +2121,30 @@ CREATE INDEX "idx_admin_audit_log_created_at" ON "public"."admin_audit_log" USIN
 
 
 
+CREATE INDEX "idx_business_competitors_business_id" ON "public"."business_competitors" USING "btree" ("business_id");
+
+
+
+CREATE INDEX "idx_business_goals_business_id" ON "public"."business_goals" USING "btree" ("business_id", "is_active");
+
+
+
+CREATE INDEX "idx_business_goals_client_id" ON "public"."business_goals" USING "btree" ("client_id");
+
+
+
+CREATE INDEX "idx_business_metrics_initiative_id" ON "public"."business_metrics" USING "btree" ("initiative_id");
+
+
+
+CREATE INDEX "idx_business_service_items_business_id" ON "public"."business_service_items" USING "btree" ("business_id");
+
+
+
+CREATE INDEX "idx_business_service_items_client_id" ON "public"."business_service_items" USING "btree" ("client_id");
+
+
+
 CREATE INDEX "idx_client_employees_client_id" ON "public"."client_employees" USING "btree" ("client_id");
 
 
@@ -1415,7 +2153,75 @@ CREATE INDEX "idx_client_employees_user_id" ON "public"."client_employees" USING
 
 
 
+CREATE INDEX "idx_client_updates_approval_status" ON "public"."client_updates" USING "btree" ("approval_status");
+
+
+
+CREATE INDEX "idx_client_updates_business_id" ON "public"."client_updates" USING "btree" ("business_id");
+
+
+
 CREATE INDEX "idx_data_integrity_log_created_at" ON "public"."data_integrity_log" USING "btree" ("created_at" DESC);
+
+
+
+CREATE INDEX "idx_google_ads_metrics_business_date" ON "public"."google_ads_metrics" USING "btree" ("business_id", "date");
+
+
+
+CREATE INDEX "idx_google_ads_sync_log_started_at" ON "public"."google_ads_sync_log" USING "btree" ("started_at" DESC);
+
+
+
+CREATE INDEX "idx_marketing_initiatives_business_id" ON "public"."marketing_initiatives" USING "btree" ("business_id");
+
+
+
+CREATE INDEX "idx_marketing_initiatives_goal_id" ON "public"."marketing_initiatives" USING "btree" ("goal_id");
+
+
+
+CREATE INDEX "idx_marketing_initiatives_monthly_cycle_id" ON "public"."marketing_initiatives" USING "btree" ("monthly_cycle_id");
+
+
+
+CREATE INDEX "idx_meta_ads_metrics_business_date" ON "public"."meta_ads_metrics" USING "btree" ("business_id", "date");
+
+
+
+CREATE INDEX "idx_meta_ads_sync_log_started_at" ON "public"."meta_ads_sync_log" USING "btree" ("started_at" DESC);
+
+
+
+CREATE INDEX "idx_monthly_cycles_business_id" ON "public"."monthly_cycles" USING "btree" ("business_id");
+
+
+
+CREATE INDEX "idx_monthly_cycles_client_id" ON "public"."monthly_cycles" USING "btree" ("client_id");
+
+
+
+CREATE INDEX "idx_staff_activity_log_business_id" ON "public"."staff_activity_log" USING "btree" ("business_id");
+
+
+
+CREATE INDEX "idx_staff_activity_log_created_at" ON "public"."staff_activity_log" USING "btree" ("created_at");
+
+
+
+CREATE INDEX "idx_staff_activity_log_staff_user_id" ON "public"."staff_activity_log" USING "btree" ("staff_user_id");
+
+
+
+CREATE INDEX "idx_staff_assignments_business_id" ON "public"."staff_assignments" USING "btree" ("business_id");
+
+
+
+CREATE INDEX "idx_staff_assignments_client_id" ON "public"."staff_assignments" USING "btree" ("client_id");
+
+
+
+CREATE INDEX "idx_staff_assignments_staff_user_id" ON "public"."staff_assignments" USING "btree" ("staff_user_id");
 
 
 
@@ -1427,11 +2233,31 @@ CREATE INDEX "idx_webhook_logs_key_id" ON "public"."webhook_logs" USING "btree" 
 
 
 
+CREATE INDEX "idx_work_items_assignee_status" ON "public"."work_items" USING "btree" ("assignee_user_id", "status");
+
+
+
+CREATE INDEX "idx_work_items_business_id" ON "public"."work_items" USING "btree" ("business_id");
+
+
+
+CREATE INDEX "idx_work_items_due_at_open" ON "public"."work_items" USING "btree" ("due_at") WHERE ("status" <> ALL (ARRAY['הושלם'::"text", 'נדחה'::"text"]));
+
+
+
 CREATE INDEX "lead_status_history_lead_id_idx" ON "public"."lead_status_history" USING "btree" ("lead_id", "changed_at");
 
 
 
 CREATE INDEX "outgoing_webhook_attempts_created_idx" ON "public"."outgoing_webhook_attempts" USING "btree" ("created_at" DESC);
+
+
+
+CREATE UNIQUE INDEX "uq_staff_assignments_staff_business" ON "public"."staff_assignments" USING "btree" ("staff_user_id", "business_id") WHERE ("business_id" IS NOT NULL);
+
+
+
+CREATE UNIQUE INDEX "uq_staff_assignments_staff_client" ON "public"."staff_assignments" USING "btree" ("staff_user_id", "client_id") WHERE ("client_id" IS NOT NULL);
 
 
 
@@ -1451,6 +2277,18 @@ CREATE OR REPLACE TRIGGER "trg_auto_create_lead_from_call" BEFORE INSERT ON "pub
 
 
 
+CREATE OR REPLACE TRIGGER "trg_business_competitors_updated_at" BEFORE UPDATE ON "public"."business_competitors" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_business_goals_updated_at" BEFORE UPDATE ON "public"."business_goals" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_business_service_items_updated_at" BEFORE UPDATE ON "public"."business_service_items" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
 CREATE OR REPLACE TRIGGER "trg_cleanup_client_employee_user" AFTER DELETE ON "public"."client_employees" FOR EACH ROW EXECUTE FUNCTION "public"."cleanup_client_employee_user"();
 
 
@@ -1463,7 +2301,19 @@ CREATE OR REPLACE TRIGGER "trg_client_employees_updated_at" BEFORE UPDATE ON "pu
 
 
 
+CREATE OR REPLACE TRIGGER "trg_client_updates_updated_at" BEFORE UPDATE ON "public"."client_updates" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
 CREATE OR REPLACE TRIGGER "trg_disable_webhooks_on_client_inactive" AFTER UPDATE OF "status" ON "public"."clients" FOR EACH ROW EXECUTE FUNCTION "public"."disable_webhooks_on_client_inactive"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_marketing_initiatives_updated_at" BEFORE UPDATE ON "public"."marketing_initiatives" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_monthly_cycles_updated_at" BEFORE UPDATE ON "public"."monthly_cycles" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
 
@@ -1491,6 +2341,10 @@ CREATE OR REPLACE TRIGGER "trg_webhook_dlq_updated_at" BEFORE UPDATE ON "public"
 
 
 
+CREATE OR REPLACE TRIGGER "trg_work_items_updated_at" BEFORE UPDATE ON "public"."work_items" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
 CREATE OR REPLACE TRIGGER "update_agency_settings_updated_at" BEFORE UPDATE ON "public"."agency_settings" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
@@ -1499,11 +2353,11 @@ CREATE OR REPLACE TRIGGER "update_business_metrics_updated_at" BEFORE UPDATE ON 
 
 
 
-CREATE OR REPLACE TRIGGER "update_business_targets_updated_at" BEFORE UPDATE ON "public"."business_targets" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
-
-
-
 CREATE OR REPLACE TRIGGER "update_businesses_updated_at" BEFORE UPDATE ON "public"."businesses" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_client_ad_accounts_updated_at" BEFORE UPDATE ON "public"."client_ad_accounts" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
 
@@ -1519,11 +2373,19 @@ CREATE OR REPLACE TRIGGER "update_freelancer_tasks_updated_at" BEFORE UPDATE ON 
 
 
 
+CREATE OR REPLACE TRIGGER "update_google_ads_metrics_updated_at" BEFORE UPDATE ON "public"."google_ads_metrics" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
 CREATE OR REPLACE TRIGGER "update_incoming_call_webhook_keys_updated_at" BEFORE UPDATE ON "public"."incoming_call_webhook_keys" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
 
 CREATE OR REPLACE TRIGGER "update_leads_updated_at" BEFORE UPDATE ON "public"."leads" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_meta_ads_metrics_updated_at" BEFORE UPDATE ON "public"."meta_ads_metrics" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
 
@@ -1547,6 +2409,21 @@ CREATE OR REPLACE TRIGGER "update_team_details_updated_at" BEFORE UPDATE ON "pub
 
 
 
+ALTER TABLE ONLY "public"."business_competitors"
+    ADD CONSTRAINT "business_competitors_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."business_goals"
+    ADD CONSTRAINT "business_goals_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."business_goals"
+    ADD CONSTRAINT "business_goals_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."business_metrics"
     ADD CONSTRAINT "business_metrics_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
 
@@ -1557,13 +2434,18 @@ ALTER TABLE ONLY "public"."business_metrics"
 
 
 
-ALTER TABLE ONLY "public"."business_targets"
-    ADD CONSTRAINT "business_targets_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."business_metrics"
+    ADD CONSTRAINT "business_metrics_initiative_id_fkey" FOREIGN KEY ("initiative_id") REFERENCES "public"."marketing_initiatives"("id") ON DELETE SET NULL;
 
 
 
-ALTER TABLE ONLY "public"."business_targets"
-    ADD CONSTRAINT "business_targets_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."business_service_items"
+    ADD CONSTRAINT "business_service_items_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."business_service_items"
+    ADD CONSTRAINT "business_service_items_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
 
 
 
@@ -1602,6 +2484,16 @@ ALTER TABLE ONLY "public"."calls"
 
 
 
+ALTER TABLE ONLY "public"."client_ad_accounts"
+    ADD CONSTRAINT "client_ad_accounts_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."client_ad_accounts"
+    ADD CONSTRAINT "client_ad_accounts_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."client_employees"
     ADD CONSTRAINT "client_employees_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
 
@@ -1609,6 +2501,16 @@ ALTER TABLE ONLY "public"."client_employees"
 
 ALTER TABLE ONLY "public"."client_employees"
     ADD CONSTRAINT "client_employees_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."client_updates"
+    ADD CONSTRAINT "client_updates_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."client_updates"
+    ADD CONSTRAINT "client_updates_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
 
 
 
@@ -1652,6 +2554,16 @@ ALTER TABLE ONLY "public"."freelancer_tasks"
 
 
 
+ALTER TABLE ONLY "public"."google_ads_metrics"
+    ADD CONSTRAINT "google_ads_metrics_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."google_ads_metrics"
+    ADD CONSTRAINT "google_ads_metrics_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."incoming_call_webhook_keys"
     ADD CONSTRAINT "incoming_call_webhook_keys_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
 
@@ -1687,6 +2599,26 @@ ALTER TABLE ONLY "public"."leads"
 
 
 
+ALTER TABLE ONLY "public"."marketing_initiatives"
+    ADD CONSTRAINT "marketing_initiatives_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."marketing_initiatives"
+    ADD CONSTRAINT "marketing_initiatives_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."marketing_initiatives"
+    ADD CONSTRAINT "marketing_initiatives_goal_id_fkey" FOREIGN KEY ("goal_id") REFERENCES "public"."business_goals"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."marketing_initiatives"
+    ADD CONSTRAINT "marketing_initiatives_monthly_cycle_id_fkey" FOREIGN KEY ("monthly_cycle_id") REFERENCES "public"."monthly_cycles"("id") ON DELETE SET NULL;
+
+
+
 ALTER TABLE ONLY "public"."messages"
     ADD CONSTRAINT "messages_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
 
@@ -1699,6 +2631,26 @@ ALTER TABLE ONLY "public"."messages"
 
 ALTER TABLE ONLY "public"."messages"
     ADD CONSTRAINT "messages_sender_id_fkey" FOREIGN KEY ("sender_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."meta_ads_metrics"
+    ADD CONSTRAINT "meta_ads_metrics_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."meta_ads_metrics"
+    ADD CONSTRAINT "meta_ads_metrics_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."monthly_cycles"
+    ADD CONSTRAINT "monthly_cycles_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."monthly_cycles"
+    ADD CONSTRAINT "monthly_cycles_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
 
 
 
@@ -1757,6 +2709,26 @@ ALTER TABLE ONLY "public"."requests"
 
 
 
+ALTER TABLE ONLY "public"."staff_activity_log"
+    ADD CONSTRAINT "staff_activity_log_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."staff_activity_log"
+    ADD CONSTRAINT "staff_activity_log_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."staff_assignments"
+    ADD CONSTRAINT "staff_assignments_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."staff_assignments"
+    ADD CONSTRAINT "staff_assignments_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."webhook_dlq"
     ADD CONSTRAINT "webhook_dlq_webhook_config_id_fkey" FOREIGN KEY ("webhook_config_id") REFERENCES "public"."webhook_configs"("id") ON DELETE CASCADE;
 
@@ -1779,6 +2751,54 @@ ALTER TABLE ONLY "public"."webhook_logs"
 
 ALTER TABLE ONLY "public"."webhook_rate_limits"
     ADD CONSTRAINT "webhook_rate_limits_webhook_key_id_fkey" FOREIGN KEY ("webhook_key_id") REFERENCES "public"."incoming_webhook_keys"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."work_items"
+    ADD CONSTRAINT "work_items_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."work_items"
+    ADD CONSTRAINT "work_items_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."work_items"
+    ADD CONSTRAINT "work_items_goal_id_fkey" FOREIGN KEY ("goal_id") REFERENCES "public"."business_goals"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."work_items"
+    ADD CONSTRAINT "work_items_initiative_id_fkey" FOREIGN KEY ("initiative_id") REFERENCES "public"."marketing_initiatives"("id") ON DELETE SET NULL;
+
+
+
+CREATE POLICY "Admin can manage business competitors" ON "public"."business_competitors" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
+CREATE POLICY "Admin can manage business service items" ON "public"."business_service_items" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
+CREATE POLICY "Admin can manage businesses" ON "public"."businesses" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
+CREATE POLICY "Admin can manage clients" ON "public"."clients" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
+CREATE POLICY "Admin can view all staff activity" ON "public"."staff_activity_log" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
+CREATE POLICY "Admin can view google ads sync log" ON "public"."google_ads_sync_log" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
+CREATE POLICY "Admin can view meta ads sync log" ON "public"."meta_ads_sync_log" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
 
@@ -1854,6 +2874,10 @@ CREATE POLICY "Admins manage client employees" ON "public"."client_employees" TO
 
 
 
+CREATE POLICY "Admins manage staff assignments" ON "public"."staff_assignments" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
 CREATE POLICY "Admins view all reminders" ON "public"."reminders" FOR SELECT USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
@@ -1870,9 +2894,11 @@ CREATE POLICY "Admins write own audit entries" ON "public"."admin_audit_log" FOR
 
 
 
-CREATE POLICY "Client can create own requests" ON "public"."requests" FOR INSERT TO "authenticated" WITH CHECK ((EXISTS ( SELECT 1
+CREATE POLICY "Client can create own requests" ON "public"."requests" FOR INSERT TO "authenticated" WITH CHECK (((EXISTS ( SELECT 1
    FROM "public"."clients"
-  WHERE (("clients"."id" = "requests"."client_id") AND ("clients"."user_id" = "auth"."uid"())))));
+  WHERE (("clients"."id" = "requests"."client_id") AND ("clients"."user_id" = "auth"."uid"())))) AND (("business_id" IS NULL) OR (EXISTS ( SELECT 1
+   FROM "public"."businesses" "b"
+  WHERE (("b"."id" = "requests"."business_id") AND ("b"."client_id" = "requests"."client_id")))))));
 
 
 
@@ -1882,29 +2908,41 @@ CREATE POLICY "Client can delete own general documents" ON "public"."documents" 
 
 
 
-CREATE POLICY "Client can insert own leads" ON "public"."leads" FOR INSERT TO "authenticated" WITH CHECK ((EXISTS ( SELECT 1
+CREATE POLICY "Client can insert own leads" ON "public"."leads" FOR INSERT TO "authenticated" WITH CHECK (((EXISTS ( SELECT 1
    FROM "public"."clients"
-  WHERE (("clients"."id" = "leads"."client_id") AND ("clients"."user_id" = "auth"."uid"())))));
+  WHERE (("clients"."id" = "leads"."client_id") AND ("clients"."user_id" = "auth"."uid"())))) AND (("business_id" IS NULL) OR (EXISTS ( SELECT 1
+   FROM "public"."businesses" "b"
+  WHERE (("b"."id" = "leads"."business_id") AND ("b"."client_id" = "leads"."client_id")))))));
 
 
 
-CREATE POLICY "Client can send messages" ON "public"."messages" FOR INSERT TO "authenticated" WITH CHECK ((EXISTS ( SELECT 1
+CREATE POLICY "Client can send messages" ON "public"."messages" FOR INSERT TO "authenticated" WITH CHECK (((EXISTS ( SELECT 1
    FROM "public"."clients"
-  WHERE (("clients"."id" = "messages"."client_id") AND ("clients"."user_id" = "auth"."uid"())))));
+  WHERE (("clients"."id" = "messages"."client_id") AND ("clients"."user_id" = "auth"."uid"())))) AND (("business_id" IS NULL) OR (EXISTS ( SELECT 1
+   FROM "public"."businesses" "b"
+  WHERE (("b"."id" = "messages"."business_id") AND ("b"."client_id" = "messages"."client_id")))))));
 
 
 
 CREATE POLICY "Client can update own leads" ON "public"."leads" FOR UPDATE TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."clients"
-  WHERE (("clients"."id" = "leads"."client_id") AND ("clients"."user_id" = "auth"."uid"()))))) WITH CHECK ((EXISTS ( SELECT 1
+  WHERE (("clients"."id" = "leads"."client_id") AND ("clients"."user_id" = "auth"."uid"()))))) WITH CHECK (((EXISTS ( SELECT 1
    FROM "public"."clients"
-  WHERE (("clients"."id" = "leads"."client_id") AND ("clients"."user_id" = "auth"."uid"())))));
+  WHERE (("clients"."id" = "leads"."client_id") AND ("clients"."user_id" = "auth"."uid"())))) AND (("business_id" IS NULL) OR (EXISTS ( SELECT 1
+   FROM "public"."businesses" "b"
+  WHERE (("b"."id" = "leads"."business_id") AND ("b"."client_id" = "leads"."client_id")))))));
 
 
 
 CREATE POLICY "Client can upload own general documents" ON "public"."documents" FOR INSERT TO "authenticated" WITH CHECK ((("category" IS NULL) AND (EXISTS ( SELECT 1
    FROM "public"."clients" "c"
-  WHERE (("c"."id" = "documents"."client_id") AND ("c"."user_id" = "auth"."uid"()))))));
+  WHERE (("c"."id" = "documents"."client_id") AND ("c"."user_id" = "auth"."uid"())))) AND (("business_id" IS NULL) OR (EXISTS ( SELECT 1
+   FROM "public"."businesses" "b"
+  WHERE (("b"."id" = "documents"."business_id") AND ("b"."client_id" = "documents"."client_id")))))));
+
+
+
+CREATE POLICY "Client can view approved sent updates" ON "public"."client_updates" FOR SELECT TO "authenticated" USING ((("approval_status" = 'מאושר'::"text") AND ("send_status" = 'נשלח'::"text") AND ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))));
 
 
 
@@ -1926,6 +2964,12 @@ CREATE POLICY "Client can view own documents" ON "public"."documents" FOR SELECT
 
 
 
+CREATE POLICY "Client can view own google ads metrics" ON "public"."google_ads_metrics" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
+   FROM "public"."clients"
+  WHERE (("clients"."id" = "google_ads_metrics"."client_id") AND ("clients"."user_id" = "auth"."uid"())))));
+
+
+
 CREATE POLICY "Client can view own leads" ON "public"."leads" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."clients"
   WHERE (("clients"."id" = "leads"."client_id") AND ("clients"."user_id" = "auth"."uid"())))));
@@ -1941,6 +2985,12 @@ CREATE POLICY "Client can view own linked tasks" ON "public"."freelancer_tasks" 
 CREATE POLICY "Client can view own messages" ON "public"."messages" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."clients"
   WHERE (("clients"."id" = "messages"."client_id") AND ("clients"."user_id" = "auth"."uid"())))));
+
+
+
+CREATE POLICY "Client can view own meta ads metrics" ON "public"."meta_ads_metrics" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
+   FROM "public"."clients"
+  WHERE (("clients"."id" = "meta_ads_metrics"."client_id") AND ("clients"."user_id" = "auth"."uid"())))));
 
 
 
@@ -1979,29 +3029,23 @@ CREATE POLICY "Client can view own requests" ON "public"."requests" FOR SELECT T
 
 
 
-CREATE POLICY "Client can view own targets" ON "public"."business_targets" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
-   FROM "public"."clients"
-  WHERE (("clients"."id" = "business_targets"."client_id") AND ("clients"."user_id" = "auth"."uid"())))));
+CREATE POLICY "Client employee can create requests" ON "public"."requests" FOR INSERT TO "authenticated" WITH CHECK ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'requests'::"text", 'edit'::"text")));
 
 
 
-CREATE POLICY "Client employee can create requests" ON "public"."requests" FOR INSERT TO "authenticated" WITH CHECK ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"()))))));
+CREATE POLICY "Client employee can delete leads" ON "public"."leads" FOR DELETE TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'leads'::"text", 'edit'::"text")));
 
 
 
-CREATE POLICY "Client employee can delete leads" ON "public"."leads" FOR DELETE TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"()))))));
+CREATE POLICY "Client employee can insert leads" ON "public"."leads" FOR INSERT TO "authenticated" WITH CHECK ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'leads'::"text", 'edit'::"text")));
 
 
 
-CREATE POLICY "Client employee can insert leads" ON "public"."leads" FOR INSERT TO "authenticated" WITH CHECK ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"()))))));
+CREATE POLICY "Client employee can send messages" ON "public"."messages" FOR INSERT TO "authenticated" WITH CHECK ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND ("sender_id" = "auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'messages'::"text", 'edit'::"text")));
 
 
 
-CREATE POLICY "Client employee can send messages" ON "public"."messages" FOR INSERT TO "authenticated" WITH CHECK ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND ("sender_id" = "auth"."uid"())));
-
-
-
-CREATE POLICY "Client employee can update leads" ON "public"."leads" FOR UPDATE TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))))) WITH CHECK ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"()))))));
+CREATE POLICY "Client employee can update leads" ON "public"."leads" FOR UPDATE TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'leads'::"text", 'edit'::"text"))) WITH CHECK ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'leads'::"text", 'edit'::"text")));
 
 
 
@@ -2009,27 +3053,35 @@ CREATE POLICY "Client employee can view businesses" ON "public"."businesses" FOR
 
 
 
-CREATE POLICY "Client employee can view calls" ON "public"."calls" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"()))))));
+CREATE POLICY "Client employee can view calls" ON "public"."calls" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'calls'::"text", 'view'::"text")));
 
 
 
-CREATE POLICY "Client employee can view documents" ON "public"."documents" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"()))))));
+CREATE POLICY "Client employee can view documents" ON "public"."documents" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'documents'::"text", 'view'::"text")));
 
 
 
-CREATE POLICY "Client employee can view leads" ON "public"."leads" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"()))))));
+CREATE POLICY "Client employee can view google ads metrics" ON "public"."google_ads_metrics" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"()))) AND "public"."has_portal_permission"("auth"."uid"(), 'analytics'::"text", 'view'::"text")));
 
 
 
-CREATE POLICY "Client employee can view linked tasks" ON "public"."freelancer_tasks" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"()))))));
+CREATE POLICY "Client employee can view leads" ON "public"."leads" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'leads'::"text", 'view'::"text")));
 
 
 
-CREATE POLICY "Client employee can view messages" ON "public"."messages" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"())));
+CREATE POLICY "Client employee can view linked tasks" ON "public"."freelancer_tasks" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'projects'::"text", 'view'::"text")));
 
 
 
-CREATE POLICY "Client employee can view metrics" ON "public"."business_metrics" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"()))))));
+CREATE POLICY "Client employee can view messages" ON "public"."messages" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'messages'::"text", 'view'::"text")));
+
+
+
+CREATE POLICY "Client employee can view meta ads metrics" ON "public"."meta_ads_metrics" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"()))) AND "public"."has_portal_permission"("auth"."uid"(), 'analytics'::"text", 'view'::"text")));
+
+
+
+CREATE POLICY "Client employee can view metrics" ON "public"."business_metrics" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'analytics'::"text", 'view'::"text")));
 
 
 
@@ -2037,19 +3089,15 @@ CREATE POLICY "Client employee can view owner client" ON "public"."clients" FOR 
 
 
 
-CREATE POLICY "Client employee can view projects" ON "public"."projects" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"()))))));
+CREATE POLICY "Client employee can view projects" ON "public"."projects" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'projects'::"text", 'view'::"text")));
 
 
 
-CREATE POLICY "Client employee can view reports" ON "public"."reports" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"()))))));
+CREATE POLICY "Client employee can view reports" ON "public"."reports" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'reports'::"text", 'view'::"text")));
 
 
 
-CREATE POLICY "Client employee can view requests" ON "public"."requests" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"()))))));
-
-
-
-CREATE POLICY "Client employee can view targets" ON "public"."business_targets" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"()))))));
+CREATE POLICY "Client employee can view requests" ON "public"."requests" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'requests'::"text", 'view'::"text")));
 
 
 
@@ -2127,15 +3175,63 @@ CREATE POLICY "Reviewers manage their own reviews" ON "public"."peer_reviews" TO
 
 
 
-CREATE POLICY "Staff can manage business metrics" ON "public"."business_metrics" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role")));
+CREATE POLICY "Staff can log own activity" ON "public"."staff_activity_log" FOR INSERT TO "authenticated" WITH CHECK (("staff_user_id" = "auth"."uid"()));
 
 
 
-CREATE POLICY "Staff can manage business targets" ON "public"."business_targets" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role")));
+CREATE POLICY "Staff can manage assigned ad account mappings" ON "public"."client_ad_accounts" TO "authenticated" USING ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) WITH CHECK ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id"));
 
 
 
-CREATE POLICY "Staff can manage businesses" ON "public"."businesses" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role")));
+CREATE POLICY "Staff can manage assigned business goals" ON "public"."business_goals" TO "authenticated" USING ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) WITH CHECK ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id"));
+
+
+
+CREATE POLICY "Staff can manage assigned business metrics" ON "public"."business_metrics" TO "authenticated" USING ((((("business_id" IS NOT NULL) AND "public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) OR (("business_id" IS NULL) AND "public"."is_staff_assigned_to_client"("auth"."uid"(), "client_id"))) AND (("business_id" IS NULL) OR ("public"."get_staff_allowed_platforms"("auth"."uid"(), "business_id") IS NULL) OR ("platform" = ANY ("public"."get_staff_allowed_platforms"("auth"."uid"(), "business_id")))))) WITH CHECK ((((("business_id" IS NOT NULL) AND "public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) OR (("business_id" IS NULL) AND "public"."is_staff_assigned_to_client"("auth"."uid"(), "client_id"))) AND (("business_id" IS NULL) OR ("public"."get_staff_allowed_platforms"("auth"."uid"(), "business_id") IS NULL) OR ("platform" = ANY ("public"."get_staff_allowed_platforms"("auth"."uid"(), "business_id"))))));
+
+
+
+CREATE POLICY "Staff can manage assigned client updates" ON "public"."client_updates" TO "authenticated" USING ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) WITH CHECK ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id"));
+
+
+
+CREATE POLICY "Staff can manage assigned documents" ON "public"."documents" TO "authenticated" USING ((((("business_id" IS NOT NULL) AND "public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) OR (("business_id" IS NULL) AND "public"."is_staff_assigned_to_client"("auth"."uid"(), "client_id"))) AND ((NOT "public"."has_role"("auth"."uid"(), 'freelancer'::"public"."app_role")) OR ("visible_to_freelancers" = true)))) WITH CHECK (((("business_id" IS NOT NULL) AND "public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) OR (("business_id" IS NULL) AND "public"."is_staff_assigned_to_client"("auth"."uid"(), "client_id"))));
+
+
+
+CREATE POLICY "Staff can manage assigned google ads metrics" ON "public"."google_ads_metrics" TO "authenticated" USING ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) WITH CHECK ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id"));
+
+
+
+CREATE POLICY "Staff can manage assigned leads" ON "public"."leads" TO "authenticated" USING (((("business_id" IS NOT NULL) AND "public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) OR (("business_id" IS NULL) AND "public"."is_staff_assigned_to_client"("auth"."uid"(), "client_id")))) WITH CHECK (((("business_id" IS NOT NULL) AND "public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) OR (("business_id" IS NULL) AND "public"."is_staff_assigned_to_client"("auth"."uid"(), "client_id"))));
+
+
+
+CREATE POLICY "Staff can manage assigned marketing initiatives" ON "public"."marketing_initiatives" TO "authenticated" USING (("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id") AND (("public"."get_staff_allowed_platforms"("auth"."uid"(), "business_id") IS NULL) OR ("channels" && "public"."get_staff_allowed_platforms"("auth"."uid"(), "business_id"))))) WITH CHECK (("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id") AND (("public"."get_staff_allowed_platforms"("auth"."uid"(), "business_id") IS NULL) OR ("channels" && "public"."get_staff_allowed_platforms"("auth"."uid"(), "business_id")))));
+
+
+
+CREATE POLICY "Staff can manage assigned messages" ON "public"."messages" TO "authenticated" USING (((("business_id" IS NOT NULL) AND "public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) OR (("business_id" IS NULL) AND "public"."is_staff_assigned_to_client"("auth"."uid"(), "client_id")))) WITH CHECK (((("business_id" IS NOT NULL) AND "public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) OR (("business_id" IS NULL) AND "public"."is_staff_assigned_to_client"("auth"."uid"(), "client_id"))));
+
+
+
+CREATE POLICY "Staff can manage assigned meta ads metrics" ON "public"."meta_ads_metrics" TO "authenticated" USING ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) WITH CHECK ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id"));
+
+
+
+CREATE POLICY "Staff can manage assigned monthly cycles" ON "public"."monthly_cycles" TO "authenticated" USING ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) WITH CHECK ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id"));
+
+
+
+CREATE POLICY "Staff can manage assigned projects" ON "public"."projects" TO "authenticated" USING (((("business_id" IS NOT NULL) AND "public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) OR (("business_id" IS NULL) AND "public"."is_staff_assigned_to_client"("auth"."uid"(), "client_id")))) WITH CHECK (((("business_id" IS NOT NULL) AND "public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) OR (("business_id" IS NULL) AND "public"."is_staff_assigned_to_client"("auth"."uid"(), "client_id"))));
+
+
+
+CREATE POLICY "Staff can manage assigned requests" ON "public"."requests" TO "authenticated" USING (((("business_id" IS NOT NULL) AND "public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) OR (("business_id" IS NULL) AND "public"."is_staff_assigned_to_client"("auth"."uid"(), "client_id")))) WITH CHECK (((("business_id" IS NOT NULL) AND "public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) OR (("business_id" IS NULL) AND "public"."is_staff_assigned_to_client"("auth"."uid"(), "client_id"))));
+
+
+
+CREATE POLICY "Staff can manage assigned work items" ON "public"."work_items" TO "authenticated" USING ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) WITH CHECK ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id"));
 
 
 
@@ -2143,27 +3239,7 @@ CREATE POLICY "Staff can manage calls" ON "public"."calls" TO "authenticated" US
 
 
 
-CREATE POLICY "Staff can manage clients" ON "public"."clients" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role")));
-
-
-
-CREATE POLICY "Staff can manage documents" ON "public"."documents" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role")));
-
-
-
 CREATE POLICY "Staff can manage freelancer messages" ON "public"."freelancer_messages" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role")));
-
-
-
-CREATE POLICY "Staff can manage leads" ON "public"."leads" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role")));
-
-
-
-CREATE POLICY "Staff can manage messages" ON "public"."messages" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role")));
-
-
-
-CREATE POLICY "Staff can manage projects" ON "public"."projects" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role")));
 
 
 
@@ -2172,10 +3248,6 @@ CREATE POLICY "Staff can manage replies" ON "public"."request_replies" TO "authe
 
 
 CREATE POLICY "Staff can manage reports" ON "public"."reports" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role")));
-
-
-
-CREATE POLICY "Staff can manage requests" ON "public"."requests" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role")));
 
 
 
@@ -2192,6 +3264,30 @@ CREATE POLICY "Staff can view all profiles" ON "public"."profiles" FOR SELECT TO
 
 
 CREATE POLICY "Staff can view all team details" ON "public"."team_details" FOR SELECT TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'employee'::"public"."app_role")));
+
+
+
+CREATE POLICY "Staff can view assigned business competitors" ON "public"."business_competitors" FOR SELECT TO "authenticated" USING ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id"));
+
+
+
+CREATE POLICY "Staff can view assigned business service items" ON "public"."business_service_items" FOR SELECT TO "authenticated" USING ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id"));
+
+
+
+CREATE POLICY "Staff can view assigned businesses" ON "public"."businesses" FOR SELECT TO "authenticated" USING ("public"."is_staff_assigned_to_business"("auth"."uid"(), "id"));
+
+
+
+CREATE POLICY "Staff can view assigned clients" ON "public"."clients" FOR SELECT TO "authenticated" USING ("public"."is_staff_assigned_to_client"("auth"."uid"(), "id"));
+
+
+
+CREATE POLICY "Staff can view own activity" ON "public"."staff_activity_log" FOR SELECT TO "authenticated" USING (("staff_user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "Staff can view own assignments" ON "public"."staff_assignments" FOR SELECT TO "authenticated" USING (("staff_user_id" = "auth"."uid"()));
 
 
 
@@ -2231,10 +3327,16 @@ ALTER TABLE "public"."admin_audit_log" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."agency_settings" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."business_competitors" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."business_goals" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."business_metrics" ENABLE ROW LEVEL SECURITY;
 
 
-ALTER TABLE "public"."business_targets" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "public"."business_service_items" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."businesses" ENABLE ROW LEVEL SECURITY;
@@ -2249,7 +3351,13 @@ ALTER TABLE "public"."call_webhook_rate_limits" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."calls" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."client_ad_accounts" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."client_employees" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."client_updates" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."clients" ENABLE ROW LEVEL SECURITY;
@@ -2273,6 +3381,12 @@ ALTER TABLE "public"."freelancer_task_comments" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."freelancer_tasks" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."google_ads_metrics" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."google_ads_sync_log" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."incoming_call_webhook_keys" ENABLE ROW LEVEL SECURITY;
 
 
@@ -2285,7 +3399,19 @@ ALTER TABLE "public"."lead_status_history" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."leads" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."marketing_initiatives" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."messages" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."meta_ads_metrics" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."meta_ads_sync_log" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."monthly_cycles" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."outgoing_webhook_attempts" ENABLE ROW LEVEL SECURITY;
@@ -2312,6 +3438,12 @@ ALTER TABLE "public"."request_replies" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."requests" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."staff_activity_log" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."staff_assignments" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."team_details" ENABLE ROW LEVEL SECURITY;
 
 
@@ -2328,6 +3460,9 @@ ALTER TABLE "public"."webhook_logs" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."webhook_rate_limits" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."work_items" ENABLE ROW LEVEL SECURITY;
 
 
 
@@ -2347,11 +3482,11 @@ ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."agency_settings";
 
 
 
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."business_goals";
+
+
+
 ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."business_metrics";
-
-
-
-ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."business_targets";
 
 
 
@@ -2364,6 +3499,10 @@ ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."calls";
 
 
 ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."client_employees";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."client_updates";
 
 
 
@@ -2403,7 +3542,15 @@ ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."leads";
 
 
 
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."marketing_initiatives";
+
+
+
 ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."messages";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."monthly_cycles";
 
 
 
@@ -2439,6 +3586,10 @@ ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."requests";
 
 
 
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."staff_assignments";
+
+
+
 ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."team_details";
 
 
@@ -2452,6 +3603,10 @@ ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."webhook_dlq";
 
 
 ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."webhook_logs";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."work_items";
 
 
 
@@ -2636,6 +3791,24 @@ GRANT USAGE ON SCHEMA "public" TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."admin_get_staff_allowed_business_ids"("_target_user_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."admin_get_staff_allowed_business_ids"("_target_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."admin_get_staff_allowed_business_ids"("_target_user_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."admin_get_staff_allowed_client_ids"("_target_user_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."admin_get_staff_allowed_client_ids"("_target_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."admin_get_staff_allowed_client_ids"("_target_user_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."admin_get_staff_allowed_platforms"("_target_user_id" "uuid", "_business_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."admin_get_staff_allowed_platforms"("_target_user_id" "uuid", "_business_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."admin_get_staff_allowed_platforms"("_target_user_id" "uuid", "_business_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."auto_create_lead_from_call"() TO "anon";
 GRANT ALL ON FUNCTION "public"."auto_create_lead_from_call"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."auto_create_lead_from_call"() TO "service_role";
@@ -2649,6 +3822,16 @@ GRANT ALL ON FUNCTION "public"."block_unknown_google_signup"() TO "service_role"
 
 GRANT ALL ON FUNCTION "public"."can_access_business"("_user_id" "uuid", "_business_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."can_access_business"("_user_id" "uuid", "_business_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."check_and_increment_call_webhook_rate_limit"("_webhook_key_id" "uuid", "_limit" integer, "_window_ms" bigint) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."check_and_increment_call_webhook_rate_limit"("_webhook_key_id" "uuid", "_limit" integer, "_window_ms" bigint) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."check_and_increment_webhook_rate_limit"("_webhook_key_id" "uuid", "_limit" integer, "_window_ms" bigint) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."check_and_increment_webhook_rate_limit"("_webhook_key_id" "uuid", "_limit" integer, "_window_ms" bigint) TO "service_role";
 
 
 
@@ -2679,6 +3862,13 @@ GRANT ALL ON FUNCTION "public"."get_allowed_business_ids"("_user_id" "uuid") TO 
 
 
 
+REVOKE ALL ON FUNCTION "public"."get_freelancer_names"("_user_ids" "uuid"[]) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."get_freelancer_names"("_user_ids" "uuid"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."get_freelancer_names"("_user_ids" "uuid"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_freelancer_names"("_user_ids" "uuid"[]) TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."get_freelancer_task_entities"("_task_ids" "uuid"[]) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_freelancer_task_entities"("_task_ids" "uuid"[]) TO "service_role";
 
@@ -2701,6 +3891,24 @@ GRANT ALL ON FUNCTION "public"."get_safe_team_details"("_user_ids" "uuid"[]) TO 
 
 
 
+GRANT ALL ON FUNCTION "public"."get_staff_allowed_business_ids"("_user_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_staff_allowed_business_ids"("_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_staff_allowed_business_ids"("_user_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."get_staff_allowed_client_ids"("_user_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_staff_allowed_client_ids"("_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_staff_allowed_client_ids"("_user_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."get_staff_allowed_platforms"("_user_id" "uuid", "_business_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_staff_allowed_platforms"("_user_id" "uuid", "_business_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_staff_allowed_platforms"("_user_id" "uuid", "_business_id" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."get_team_member_position"("_user_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."get_team_member_position"("_user_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_team_member_position"("_user_id" "uuid") TO "service_role";
@@ -2712,6 +3920,12 @@ GRANT ALL ON FUNCTION "public"."handle_new_user"() TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."has_portal_permission"("_user_id" "uuid", "_screen" "text", "_mode" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."has_portal_permission"("_user_id" "uuid", "_screen" "text", "_mode" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."has_portal_permission"("_user_id" "uuid", "_screen" "text", "_mode" "text") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."has_role"("_user_id" "uuid", "_role" "public"."app_role") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."has_role"("_user_id" "uuid", "_role" "public"."app_role") TO "service_role";
 
@@ -2719,6 +3933,18 @@ GRANT ALL ON FUNCTION "public"."has_role"("_user_id" "uuid", "_role" "public"."a
 
 GRANT ALL ON FUNCTION "public"."is_client_employee"("_user_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."is_client_employee"("_user_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."is_staff_assigned_to_business"("_user_id" "uuid", "_business_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."is_staff_assigned_to_business"("_user_id" "uuid", "_business_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_staff_assigned_to_business"("_user_id" "uuid", "_business_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."is_staff_assigned_to_client"("_user_id" "uuid", "_client_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."is_staff_assigned_to_client"("_user_id" "uuid", "_client_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_staff_assigned_to_client"("_user_id" "uuid", "_client_id" "uuid") TO "service_role";
 
 
 
@@ -2796,15 +4022,27 @@ GRANT ALL ON TABLE "public"."agency_settings" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."business_competitors" TO "anon";
+GRANT ALL ON TABLE "public"."business_competitors" TO "authenticated";
+GRANT ALL ON TABLE "public"."business_competitors" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."business_goals" TO "anon";
+GRANT ALL ON TABLE "public"."business_goals" TO "authenticated";
+GRANT ALL ON TABLE "public"."business_goals" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."business_metrics" TO "anon";
 GRANT ALL ON TABLE "public"."business_metrics" TO "authenticated";
 GRANT ALL ON TABLE "public"."business_metrics" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."business_targets" TO "anon";
-GRANT ALL ON TABLE "public"."business_targets" TO "authenticated";
-GRANT ALL ON TABLE "public"."business_targets" TO "service_role";
+GRANT ALL ON TABLE "public"."business_service_items" TO "anon";
+GRANT ALL ON TABLE "public"."business_service_items" TO "authenticated";
+GRANT ALL ON TABLE "public"."business_service_items" TO "service_role";
 
 
 
@@ -2832,9 +4070,21 @@ GRANT ALL ON TABLE "public"."calls" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."client_ad_accounts" TO "anon";
+GRANT ALL ON TABLE "public"."client_ad_accounts" TO "authenticated";
+GRANT ALL ON TABLE "public"."client_ad_accounts" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."client_employees" TO "anon";
 GRANT ALL ON TABLE "public"."client_employees" TO "authenticated";
 GRANT ALL ON TABLE "public"."client_employees" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."client_updates" TO "anon";
+GRANT ALL ON TABLE "public"."client_updates" TO "authenticated";
+GRANT ALL ON TABLE "public"."client_updates" TO "service_role";
 
 
 
@@ -2880,6 +4130,18 @@ GRANT ALL ON TABLE "public"."freelancer_tasks" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."google_ads_metrics" TO "anon";
+GRANT ALL ON TABLE "public"."google_ads_metrics" TO "authenticated";
+GRANT ALL ON TABLE "public"."google_ads_metrics" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."google_ads_sync_log" TO "anon";
+GRANT ALL ON TABLE "public"."google_ads_sync_log" TO "authenticated";
+GRANT ALL ON TABLE "public"."google_ads_sync_log" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."incoming_call_webhook_keys" TO "anon";
 GRANT ALL ON TABLE "public"."incoming_call_webhook_keys" TO "authenticated";
 GRANT ALL ON TABLE "public"."incoming_call_webhook_keys" TO "service_role";
@@ -2904,9 +4166,33 @@ GRANT ALL ON TABLE "public"."leads" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."marketing_initiatives" TO "anon";
+GRANT ALL ON TABLE "public"."marketing_initiatives" TO "authenticated";
+GRANT ALL ON TABLE "public"."marketing_initiatives" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."messages" TO "anon";
 GRANT ALL ON TABLE "public"."messages" TO "authenticated";
 GRANT ALL ON TABLE "public"."messages" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."meta_ads_metrics" TO "anon";
+GRANT ALL ON TABLE "public"."meta_ads_metrics" TO "authenticated";
+GRANT ALL ON TABLE "public"."meta_ads_metrics" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."meta_ads_sync_log" TO "anon";
+GRANT ALL ON TABLE "public"."meta_ads_sync_log" TO "authenticated";
+GRANT ALL ON TABLE "public"."meta_ads_sync_log" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."monthly_cycles" TO "anon";
+GRANT ALL ON TABLE "public"."monthly_cycles" TO "authenticated";
+GRANT ALL ON TABLE "public"."monthly_cycles" TO "service_role";
 
 
 
@@ -2958,6 +4244,18 @@ GRANT ALL ON TABLE "public"."requests" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."staff_activity_log" TO "anon";
+GRANT ALL ON TABLE "public"."staff_activity_log" TO "authenticated";
+GRANT ALL ON TABLE "public"."staff_activity_log" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."staff_assignments" TO "anon";
+GRANT ALL ON TABLE "public"."staff_assignments" TO "authenticated";
+GRANT ALL ON TABLE "public"."staff_assignments" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."team_details" TO "anon";
 GRANT ALL ON TABLE "public"."team_details" TO "authenticated";
 GRANT ALL ON TABLE "public"."team_details" TO "service_role";
@@ -2991,6 +4289,12 @@ GRANT ALL ON TABLE "public"."webhook_logs" TO "service_role";
 GRANT ALL ON TABLE "public"."webhook_rate_limits" TO "anon";
 GRANT ALL ON TABLE "public"."webhook_rate_limits" TO "authenticated";
 GRANT ALL ON TABLE "public"."webhook_rate_limits" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."work_items" TO "anon";
+GRANT ALL ON TABLE "public"."work_items" TO "authenticated";
+GRANT ALL ON TABLE "public"."work_items" TO "service_role";
 
 
 
