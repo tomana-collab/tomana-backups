@@ -831,6 +831,28 @@ SET default_tablespace = '';
 SET default_table_access_method = "heap";
 
 
+CREATE TABLE IF NOT EXISTS "public"."ad_campaigns" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "business_id" "uuid" NOT NULL,
+    "client_id" "uuid" NOT NULL,
+    "ad_account_id" "text" NOT NULL,
+    "platform" "text" NOT NULL,
+    "campaign_id" "text" NOT NULL,
+    "campaign_name" "text",
+    "status" "text",
+    "is_active" boolean DEFAULT false NOT NULL,
+    "daily_budget" numeric,
+    "currency" "text",
+    "raw" "jsonb",
+    "synced_at" timestamp with time zone DEFAULT "now"(),
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"()
+);
+
+
+ALTER TABLE "public"."ad_campaigns" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."admin_audit_log" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "admin_user_id" "uuid" NOT NULL,
@@ -1749,6 +1771,35 @@ CREATE TABLE IF NOT EXISTS "public"."webhook_rate_limits" (
 ALTER TABLE "public"."webhook_rate_limits" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."weekly_business_reports" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "business_id" "uuid" NOT NULL,
+    "client_id" "uuid" NOT NULL,
+    "period_start" "date" NOT NULL,
+    "period_end" "date" NOT NULL,
+    "meta_connected" boolean DEFAULT false NOT NULL,
+    "meta_spend" numeric DEFAULT 0 NOT NULL,
+    "meta_purchases" integer DEFAULT 0 NOT NULL,
+    "meta_purchase_value" numeric DEFAULT 0 NOT NULL,
+    "google_connected" boolean DEFAULT false NOT NULL,
+    "google_spend" numeric DEFAULT 0 NOT NULL,
+    "google_conversions" numeric DEFAULT 0 NOT NULL,
+    "google_conversions_value" numeric DEFAULT 0 NOT NULL,
+    "leads_count" integer DEFAULT 0 NOT NULL,
+    "leads_closed_count" integer DEFAULT 0 NOT NULL,
+    "leads_closed_revenue" numeric DEFAULT 0 NOT NULL,
+    "total_revenue" numeric DEFAULT 0 NOT NULL,
+    "message" "text" NOT NULL,
+    "status" "text" DEFAULT 'sent'::"text" NOT NULL,
+    "dispatch_result" "jsonb",
+    "error" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."weekly_business_reports" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."work_items" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "business_id" "uuid" NOT NULL,
@@ -1779,6 +1830,16 @@ ALTER TABLE ONLY "public"."work_items" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."work_items" OWNER TO "postgres";
+
+
+ALTER TABLE ONLY "public"."ad_campaigns"
+    ADD CONSTRAINT "ad_campaigns_business_id_platform_campaign_id_key" UNIQUE ("business_id", "platform", "campaign_id");
+
+
+
+ALTER TABLE ONLY "public"."ad_campaigns"
+    ADD CONSTRAINT "ad_campaigns_pkey" PRIMARY KEY ("id");
+
 
 
 ALTER TABLE ONLY "public"."admin_audit_log"
@@ -2096,6 +2157,16 @@ ALTER TABLE ONLY "public"."webhook_rate_limits"
 
 
 
+ALTER TABLE ONLY "public"."weekly_business_reports"
+    ADD CONSTRAINT "weekly_business_reports_business_id_period_start_key" UNIQUE ("business_id", "period_start");
+
+
+
+ALTER TABLE ONLY "public"."weekly_business_reports"
+    ADD CONSTRAINT "weekly_business_reports_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."work_items"
     ADD CONSTRAINT "work_items_pkey" PRIMARY KEY ("id");
 
@@ -2114,6 +2185,10 @@ CREATE INDEX "calls_client_id_idx" ON "public"."calls" USING "btree" ("client_id
 
 
 CREATE INDEX "calls_received_at_idx" ON "public"."calls" USING "btree" ("received_at" DESC);
+
+
+
+CREATE INDEX "idx_ad_campaigns_business" ON "public"."ad_campaigns" USING "btree" ("business_id", "platform");
 
 
 
@@ -2233,6 +2308,10 @@ CREATE INDEX "idx_webhook_logs_key_id" ON "public"."webhook_logs" USING "btree" 
 
 
 
+CREATE INDEX "idx_weekly_business_reports_business" ON "public"."weekly_business_reports" USING "btree" ("business_id", "period_start" DESC);
+
+
+
 CREATE INDEX "idx_work_items_assignee_status" ON "public"."work_items" USING "btree" ("assignee_user_id", "status");
 
 
@@ -2345,6 +2424,10 @@ CREATE OR REPLACE TRIGGER "trg_work_items_updated_at" BEFORE UPDATE ON "public".
 
 
 
+CREATE OR REPLACE TRIGGER "update_ad_campaigns_updated_at" BEFORE UPDATE ON "public"."ad_campaigns" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
 CREATE OR REPLACE TRIGGER "update_agency_settings_updated_at" BEFORE UPDATE ON "public"."agency_settings" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
@@ -2406,6 +2489,16 @@ CREATE OR REPLACE TRIGGER "update_requests_updated_at" BEFORE UPDATE ON "public"
 
 
 CREATE OR REPLACE TRIGGER "update_team_details_updated_at" BEFORE UPDATE ON "public"."team_details" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+ALTER TABLE ONLY "public"."ad_campaigns"
+    ADD CONSTRAINT "ad_campaigns_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."ad_campaigns"
+    ADD CONSTRAINT "ad_campaigns_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
 
 
 
@@ -2754,6 +2847,16 @@ ALTER TABLE ONLY "public"."webhook_rate_limits"
 
 
 
+ALTER TABLE ONLY "public"."weekly_business_reports"
+    ADD CONSTRAINT "weekly_business_reports_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."weekly_business_reports"
+    ADD CONSTRAINT "weekly_business_reports_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."work_items"
     ADD CONSTRAINT "work_items_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
 
@@ -3029,6 +3132,12 @@ CREATE POLICY "Client can view own requests" ON "public"."requests" FOR SELECT T
 
 
 
+CREATE POLICY "Client can view own weekly reports" ON "public"."weekly_business_reports" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
+   FROM "public"."clients"
+  WHERE (("clients"."id" = "weekly_business_reports"."client_id") AND ("clients"."user_id" = "auth"."uid"())))));
+
+
+
 CREATE POLICY "Client employee can create requests" ON "public"."requests" FOR INSERT TO "authenticated" WITH CHECK ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'requests'::"text", 'edit'::"text")));
 
 
@@ -3098,6 +3207,10 @@ CREATE POLICY "Client employee can view reports" ON "public"."reports" FOR SELEC
 
 
 CREATE POLICY "Client employee can view requests" ON "public"."requests" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'requests'::"text", 'view'::"text")));
+
+
+
+CREATE POLICY "Client employee can view weekly reports" ON "public"."weekly_business_reports" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))));
 
 
 
@@ -3180,6 +3293,10 @@ CREATE POLICY "Staff can log own activity" ON "public"."staff_activity_log" FOR 
 
 
 CREATE POLICY "Staff can manage assigned ad account mappings" ON "public"."client_ad_accounts" TO "authenticated" USING ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) WITH CHECK ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id"));
+
+
+
+CREATE POLICY "Staff can manage assigned ad campaigns" ON "public"."ad_campaigns" TO "authenticated" USING ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) WITH CHECK ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id"));
 
 
 
@@ -3283,6 +3400,10 @@ CREATE POLICY "Staff can view assigned clients" ON "public"."clients" FOR SELECT
 
 
 
+CREATE POLICY "Staff can view assigned weekly reports" ON "public"."weekly_business_reports" FOR SELECT TO "authenticated" USING ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id"));
+
+
+
 CREATE POLICY "Staff can view own activity" ON "public"."staff_activity_log" FOR SELECT TO "authenticated" USING (("staff_user_id" = "auth"."uid"()));
 
 
@@ -3319,6 +3440,9 @@ CREATE POLICY "Users can view own roles" ON "public"."user_roles" FOR SELECT TO 
 
 CREATE POLICY "Users manage their own reminders" ON "public"."reminders" USING (("auth"."uid"() = "user_id")) WITH CHECK (("auth"."uid"() = "user_id"));
 
+
+
+ALTER TABLE "public"."ad_campaigns" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."admin_audit_log" ENABLE ROW LEVEL SECURITY;
@@ -3460,6 +3584,9 @@ ALTER TABLE "public"."webhook_logs" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."webhook_rate_limits" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."weekly_business_reports" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."work_items" ENABLE ROW LEVEL SECURITY;
@@ -4010,6 +4137,12 @@ GRANT ALL ON FUNCTION "public"."validate_client_employee_businesses"() TO "servi
 
 
 
+GRANT ALL ON TABLE "public"."ad_campaigns" TO "anon";
+GRANT ALL ON TABLE "public"."ad_campaigns" TO "authenticated";
+GRANT ALL ON TABLE "public"."ad_campaigns" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."admin_audit_log" TO "anon";
 GRANT ALL ON TABLE "public"."admin_audit_log" TO "authenticated";
 GRANT ALL ON TABLE "public"."admin_audit_log" TO "service_role";
@@ -4289,6 +4422,12 @@ GRANT ALL ON TABLE "public"."webhook_logs" TO "service_role";
 GRANT ALL ON TABLE "public"."webhook_rate_limits" TO "anon";
 GRANT ALL ON TABLE "public"."webhook_rate_limits" TO "authenticated";
 GRANT ALL ON TABLE "public"."webhook_rate_limits" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."weekly_business_reports" TO "anon";
+GRANT ALL ON TABLE "public"."weekly_business_reports" TO "authenticated";
+GRANT ALL ON TABLE "public"."weekly_business_reports" TO "service_role";
 
 
 
