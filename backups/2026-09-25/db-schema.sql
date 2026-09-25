@@ -143,6 +143,123 @@ END$$;
 ALTER FUNCTION "public"."admin_get_staff_allowed_platforms"("_target_user_id" "uuid", "_business_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."audit_mask_secrets"("_row" "jsonb") RETURNS "jsonb"
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT coalesce(jsonb_object_agg(
+    key,
+    CASE WHEN key ~* '(key|secret|token|password)' AND value <> 'null'::jsonb
+         THEN '"***"'::jsonb ELSE value END
+  ), '{}'::jsonb)
+  FROM jsonb_each(_row);
+$$;
+
+
+ALTER FUNCTION "public"."audit_mask_secrets"("_row" "jsonb") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."audit_row_change"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  _uid uuid := auth.uid();
+  _old jsonb;
+  _new jsonb;
+  _row jsonb;
+  _details jsonb := '{}'::jsonb;
+  _k text;
+  _noise text[] := ARRAY['updated_at', 'status_updated_at', 'last_seen_at', 'last_active_at'];
+  _label text;
+  _client uuid;
+  _actor text;
+BEGIN
+  -- פעולת מערכת (cron / webhook / service role) - לא נרשמת כאן
+  IF _uid IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  IF TG_OP <> 'INSERT' THEN _old := public.audit_mask_secrets(to_jsonb(OLD)); END IF;
+  IF TG_OP <> 'DELETE' THEN _new := public.audit_mask_secrets(to_jsonb(NEW)); END IF;
+  _row := coalesce(_new, _old);
+
+  IF TG_OP = 'UPDATE' THEN
+    FOR _k IN SELECT jsonb_object_keys(_new) LOOP
+      IF NOT (_k = ANY(_noise)) AND (_new -> _k) IS DISTINCT FROM (_old -> _k) THEN
+        _details := _details || jsonb_build_object(_k, jsonb_build_object('from', _old -> _k, 'to', _new -> _k));
+      END IF;
+    END LOOP;
+    -- רק updated_at וכד' השתנו - אין מה לתעד
+    IF _details = '{}'::jsonb THEN
+      RETURN NULL;
+    END IF;
+  ELSE
+    _details := _row;
+  END IF;
+
+  IF TG_TABLE_NAME = 'clients' THEN
+    _client := (_row ->> 'id')::uuid;
+  ELSIF _row ? 'client_id' THEN
+    _client := nullif(_row ->> 'client_id', '')::uuid;
+  END IF;
+
+  _label := coalesce(
+    _row ->> 'name', _row ->> 'full_name', _row ->> 'title', _row ->> 'subject',
+    _row ->> 'campaign_name', _row ->> 'email', _row ->> 'phone', _row ->> 'cli'
+  );
+  IF _label IS NULL AND _client IS NOT NULL THEN
+    SELECT name INTO _label FROM public.clients WHERE id = _client;
+  END IF;
+
+  SELECT coalesce(full_name, email) INTO _actor FROM public.profiles WHERE user_id = _uid LIMIT 1;
+
+  INSERT INTO public.admin_audit_log
+    (admin_user_id, action, target_type, target_id, target_label, details, client_id, actor_label)
+  VALUES
+    (_uid, lower(TG_OP), TG_TABLE_NAME, nullif(_row ->> 'id', '')::uuid, _label, _details, _client, _actor);
+
+  RETURN NULL;
+EXCEPTION WHEN OTHERS THEN
+  -- תקלה ברישום לעולם לא מפילה את הפעולה של המשתמש
+  RAISE WARNING 'audit_row_change failed on %: %', TG_TABLE_NAME, SQLERRM;
+  RETURN NULL;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."audit_row_change"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."audit_user_login"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  _actor text;
+  _client uuid;
+BEGIN
+  SELECT coalesce(full_name, email) INTO _actor FROM public.profiles WHERE user_id = NEW.id LIMIT 1;
+  SELECT id INTO _client FROM public.clients WHERE user_id = NEW.id LIMIT 1;
+  IF _client IS NULL THEN
+    SELECT client_id INTO _client FROM public.client_employees WHERE user_id = NEW.id LIMIT 1;
+  END IF;
+
+  INSERT INTO public.admin_audit_log
+    (admin_user_id, action, target_type, target_id, target_label, client_id, actor_label)
+  VALUES
+    (NEW.id, 'login', 'auth', NEW.id, coalesce(_actor, NEW.email), _client, coalesce(_actor, NEW.email));
+  RETURN NULL;
+EXCEPTION WHEN OTHERS THEN
+  -- תקלה ברישום לעולם לא חוסמת התחברות
+  RETURN NULL;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."audit_user_login"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."auto_create_lead_from_call"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -209,6 +326,17 @@ $$;
 ALTER FUNCTION "public"."block_unknown_google_signup"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."business_is_managed"("_business_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (SELECT 1 FROM public.businesses b WHERE b.id = _business_id AND 'paid_ads' = ANY (b.service_packages));
+$$;
+
+
+ALTER FUNCTION "public"."business_is_managed"("_business_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."can_access_business"("_user_id" "uuid", "_business_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -222,6 +350,36 @@ $$;
 
 
 ALTER FUNCTION "public"."can_access_business"("_user_id" "uuid", "_business_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."cascade_client_inactive_to_businesses"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'auth'
+    AS $$
+DECLARE
+  _uid uuid;
+BEGIN
+  IF NEW.status IS NOT DISTINCT FROM OLD.status THEN RETURN NEW; END IF;
+
+  IF NEW.status <> 'פעיל' THEN
+    UPDATE public.businesses SET status = 'לא פעיל'
+    WHERE client_id = NEW.id AND status IS DISTINCT FROM 'לא פעיל';
+  ELSIF OLD.status IS DISTINCT FROM 'פעיל' THEN
+    UPDATE public.businesses SET status = 'פעיל'
+    WHERE client_id = NEW.id AND status IS DISTINCT FROM 'פעיל';
+  END IF;
+
+  -- בשני הכיוונים: כל מי שמחובר ללקוח (בעלים + עובדים) מנותק בשרת ונדרש להתחבר מחדש
+  PERFORM public.revoke_user_sessions(NEW.user_id);
+  FOR _uid IN SELECT user_id FROM public.client_employees WHERE client_id = NEW.id AND user_id IS NOT NULL LOOP
+    PERFORM public.revoke_user_sessions(_uid);
+  END LOOP;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."cascade_client_inactive_to_businesses"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."check_and_increment_call_webhook_rate_limit"("_webhook_key_id" "uuid", "_limit" integer, "_window_ms" bigint) RETURNS TABLE("allowed" boolean, "retry_after_seconds" integer)
@@ -347,6 +505,24 @@ $$;
 
 
 ALTER FUNCTION "public"."client_has_active_call_webhook"("_business_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."deactivate_campaigns_with_account"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF NEW.is_active = false AND OLD.is_active IS DISTINCT FROM false THEN
+    UPDATE public.ad_campaigns
+    SET is_active = false
+    WHERE ad_account_id = NEW.ad_account_id AND business_id = NEW.business_id AND is_active = true;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."deactivate_campaigns_with_account"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."disable_webhooks_on_client_inactive"() RETURNS "trigger"
@@ -650,6 +826,17 @@ $$;
 ALTER FUNCTION "public"."is_client_employee"("_user_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."is_client_side_user"() RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT public.has_role(auth.uid(), 'client'::public.app_role) OR public.is_client_employee(auth.uid());
+$$;
+
+
+ALTER FUNCTION "public"."is_client_side_user"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."is_staff_assigned_to_business"("_user_id" "uuid", "_business_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -680,6 +867,51 @@ $$;
 ALTER FUNCTION "public"."is_staff_assigned_to_client"("_user_id" "uuid", "_client_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."lead_channel_of"("_source" "text") RETURNS "text"
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT CASE
+    WHEN s IS NULL OR s = '' THEN 'other'
+    WHEN s = 'הפניה טלפונית' OR s LIKE '%טלפון%' OR s LIKE '%phone%' OR s LIKE '%call%' THEN 'phone'
+    WHEN s LIKE '%דף נחיתה%' OR s LIKE '%landing%' THEN 'landing_page'
+    WHEN s LIKE '%whatsapp%' OR s LIKE '%וואטסאפ%' OR s LIKE '%ווטסאפ%' THEN 'whatsapp'
+    WHEN s LIKE '%facebook%' OR s LIKE '%פייסבוק%' OR s = 'fb' THEN 'facebook_form'
+    WHEN s LIKE '%instagram%' OR s LIKE '%אינסטגרם%' OR s = 'ig' THEN 'instagram_form'
+    WHEN s LIKE '%google%' OR s LIKE '%גוגל%' THEN 'google_form'
+    WHEN s LIKE '%טופס%' OR s LIKE '%אתר%' OR s LIKE '%website%' OR s = 'site' OR s LIKE '%form%' THEN 'website_form'
+    WHEN s IN ('הפניה', 'המלצה', 'referral') THEN 'referral'
+    WHEN s IN ('ידני', 'manual') THEN 'manual'
+    ELSE 'other'
+  END
+  FROM (SELECT lower(btrim(_source)) AS s) t;
+$$;
+
+
+ALTER FUNCTION "public"."lead_channel_of"("_source" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."leads_recount_trigger"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF TG_OP IN ('INSERT','UPDATE') THEN
+    PERFORM public.recount_business_leads(
+      NEW.business_id, to_char(NEW.created_at AT TIME ZONE 'Asia/Jerusalem', 'YYYY-MM'));
+  END IF;
+  IF TG_OP IN ('UPDATE','DELETE') THEN
+    PERFORM public.recount_business_leads(
+      OLD.business_id, to_char(OLD.created_at AT TIME ZONE 'Asia/Jerusalem', 'YYYY-MM'));
+  END IF;
+  RETURN NULL;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."leads_recount_trigger"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."record_lead_status_change"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -698,6 +930,53 @@ $$;
 
 
 ALTER FUNCTION "public"."record_lead_status_change"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."recount_business_leads"("_business_id" "uuid", "_month" "text") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  _client_id uuid;
+  _count integer;
+BEGIN
+  IF _business_id IS NULL OR _month IS NULL THEN RETURN; END IF;
+
+  SELECT client_id INTO _client_id FROM public.businesses WHERE id = _business_id;
+  IF _client_id IS NULL THEN RETURN; END IF;
+
+  SELECT count(*) INTO _count
+  FROM public.leads
+  WHERE business_id = _business_id
+    AND to_char(created_at AT TIME ZONE 'Asia/Jerusalem', 'YYYY-MM') = _month;
+
+  INSERT INTO public.business_metrics (business_id, client_id, month, platform, leads_count, data_quality_note)
+  VALUES (_business_id, _client_id, _month, 'CRM', _count, 'auto:crm-leads ' || now()::text)
+  ON CONFLICT (business_id, month, platform)
+  DO UPDATE SET leads_count = EXCLUDED.leads_count,
+                data_quality_note = EXCLUDED.data_quality_note,
+                updated_at = now();
+END;
+$$;
+
+
+ALTER FUNCTION "public"."recount_business_leads"("_business_id" "uuid", "_month" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."revoke_user_sessions"("_user_id" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'auth'
+    AS $$
+BEGIN
+  IF _user_id IS NULL THEN RETURN; END IF;
+  DELETE FROM auth.refresh_tokens WHERE session_id IN (SELECT id FROM auth.sessions WHERE user_id = _user_id);
+  DELETE FROM auth.refresh_tokens WHERE user_id = _user_id::text;
+  DELETE FROM auth.sessions WHERE user_id = _user_id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."revoke_user_sessions"("_user_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."rls_auto_enable"() RETURNS "event_trigger"
@@ -730,6 +1009,59 @@ $$;
 
 
 ALTER FUNCTION "public"."rls_auto_enable"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."set_lead_channel"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.channel IS NULL THEN NEW.channel := public.lead_channel_of(NEW.source); END IF;
+  ELSIF NEW.source IS DISTINCT FROM OLD.source AND NEW.channel IS NOT DISTINCT FROM OLD.channel THEN
+    NEW.channel := public.lead_channel_of(NEW.source);
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."set_lead_channel"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."sync_client_email_to_auth"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'auth'
+    AS $$
+DECLARE
+  _email text := lower(btrim(coalesce(NEW.email, '')));
+BEGIN
+  IF NEW.user_id IS NULL OR _email = '' OR NEW.email IS NOT DISTINCT FROM OLD.email THEN RETURN NEW; END IF;
+
+  IF EXISTS (SELECT 1 FROM auth.users u WHERE lower(u.email) = _email AND u.id <> NEW.user_id) THEN
+    RAISE EXCEPTION 'כתובת האימייל כבר רשומה במערכת' USING ERRCODE = '23505';
+  END IF;
+
+  UPDATE auth.users
+  SET email = _email, email_confirmed_at = coalesce(email_confirmed_at, now()), updated_at = now()
+  WHERE id = NEW.user_id AND email IS DISTINCT FROM _email;
+
+  UPDATE auth.identities
+  SET identity_data = identity_data || jsonb_build_object('email', _email, 'email_verified', true), updated_at = now()
+  WHERE user_id = NEW.user_id AND provider = 'email';
+
+  -- התחברות חיצונית (Google וכו') קשורה לאימייל הישן: מוחקים, ההתחברות מעכשיו עם האימייל והסיסמה החדשים
+  DELETE FROM auth.identities WHERE user_id = NEW.user_id AND provider <> 'email';
+
+  UPDATE public.profiles SET email = _email WHERE user_id = NEW.user_id AND email IS DISTINCT FROM _email;
+
+  PERFORM public.revoke_user_sessions(NEW.user_id);
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."sync_client_email_to_auth"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."sync_client_status_to_auth_ban"() RETURNS "trigger"
@@ -831,6 +1163,29 @@ SET default_tablespace = '';
 SET default_table_access_method = "heap";
 
 
+CREATE TABLE IF NOT EXISTS "public"."ad_campaigns" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "business_id" "uuid" NOT NULL,
+    "client_id" "uuid" NOT NULL,
+    "ad_account_id" "text" NOT NULL,
+    "platform" "text" NOT NULL,
+    "campaign_id" "text" NOT NULL,
+    "campaign_name" "text",
+    "status" "text",
+    "is_active" boolean DEFAULT false NOT NULL,
+    "daily_budget" numeric,
+    "currency" "text",
+    "raw" "jsonb",
+    "synced_at" timestamp with time zone DEFAULT "now"(),
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "objective" "text"
+);
+
+
+ALTER TABLE "public"."ad_campaigns" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."admin_audit_log" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "admin_user_id" "uuid" NOT NULL,
@@ -838,7 +1193,10 @@ CREATE TABLE IF NOT EXISTS "public"."admin_audit_log" (
     "target_type" "text",
     "target_id" "uuid",
     "target_label" "text",
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "details" "jsonb",
+    "client_id" "uuid",
+    "actor_label" "text"
 );
 
 
@@ -862,6 +1220,29 @@ CREATE TABLE IF NOT EXISTS "public"."agency_settings" (
 
 
 ALTER TABLE "public"."agency_settings" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."backup_runs" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "run_type" "text" DEFAULT 'nightly'::"text" NOT NULL,
+    "status" "text" NOT NULL,
+    "backup_date" "date",
+    "started_at" timestamp with time zone,
+    "finished_at" timestamp with time zone,
+    "duration_seconds" integer,
+    "db_schema_bytes" bigint,
+    "db_data_bytes" bigint,
+    "storage_files" integer,
+    "storage_bytes" bigint,
+    "run_url" "text",
+    "error" "text",
+    "details" "jsonb",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "backup_runs_status_check" CHECK (("status" = ANY (ARRAY['success'::"text", 'failed'::"text"])))
+);
+
+
+ALTER TABLE "public"."backup_runs" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."business_competitors" (
@@ -932,7 +1313,9 @@ CREATE TABLE IF NOT EXISTS "public"."business_metrics" (
     "initiative_id" "uuid",
     "data_quality_note" "text" DEFAULT ''::"text" NOT NULL,
     "engagement_count" integer,
-    "contact_actions" integer
+    "contact_actions" integer,
+    "messaging_actions" integer DEFAULT 0,
+    "call_actions" integer DEFAULT 0
 );
 
 ALTER TABLE ONLY "public"."business_metrics" REPLICA IDENTITY FULL;
@@ -941,11 +1324,23 @@ ALTER TABLE ONLY "public"."business_metrics" REPLICA IDENTITY FULL;
 ALTER TABLE "public"."business_metrics" OWNER TO "postgres";
 
 
+COMMENT ON COLUMN "public"."business_metrics"."leads_count" IS 'לידים אמיתיים - COUNT(*) מטבלת leads לאותו עסק/חודש. נכתב רק בשורת platform=''CRM'' ע"י טריגר, לא ידני ולא ממטא/גוגל. חודשים לפני 2026-09 נשארים בערך הידני ההיסטורי (לא נוגעים בעבר).';
+
+
+
 COMMENT ON COLUMN "public"."business_metrics"."engagement_count" IS 'מעורבות (לייקים/שיתופים/תגובות) - עבור לקוחות מסוג חשיפה ומודעות';
 
 
 
 COMMENT ON COLUMN "public"."business_metrics"."contact_actions" IS 'פניות ליצירת קשר - עבור לקוחות מסוג חשיפה ומודעות';
+
+
+
+COMMENT ON COLUMN "public"."business_metrics"."messaging_actions" IS 'הודעות וואטסאפ/מסנג׳ר שנפתחו - רכיב של "תוצאות", אוטומטי ממטא/גוגל';
+
+
+
+COMMENT ON COLUMN "public"."business_metrics"."call_actions" IS 'שיחות טלפון שאושרו - רכיב של "תוצאות", אוטומטי ממטא/גוגל';
 
 
 
@@ -968,12 +1363,34 @@ CREATE TABLE IF NOT EXISTS "public"."business_service_items" (
 ALTER TABLE "public"."business_service_items" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."business_social_accounts" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "business_id" "uuid" NOT NULL,
+    "client_id" "uuid" NOT NULL,
+    "platform" "text" NOT NULL,
+    "external_id" "text" NOT NULL,
+    "parent_page_id" "text",
+    "display_name" "text",
+    "username" "text",
+    "is_active" boolean DEFAULT true NOT NULL,
+    "last_synced_at" timestamp with time zone,
+    "last_sync_status" "text",
+    "last_sync_error" "text",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    CONSTRAINT "business_social_accounts_platform_check" CHECK (("platform" = ANY (ARRAY['Facebook'::"text", 'Instagram'::"text"])))
+);
+
+
+ALTER TABLE "public"."business_social_accounts" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."businesses" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "client_id" "uuid" NOT NULL,
     "name" "text" NOT NULL,
     "status" "text" DEFAULT 'פעיל'::"text" NOT NULL,
-    "client_type" "text" DEFAULT 'שירות'::"text" NOT NULL,
+    "client_type" "text" DEFAULT 'לידים'::"text" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "contact_name" "text" DEFAULT ''::"text" NOT NULL,
@@ -994,13 +1411,24 @@ CREATE TABLE IF NOT EXISTS "public"."businesses" (
     "next_key_action" "text" DEFAULT ''::"text" NOT NULL,
     "client_status_color" "text" DEFAULT 'אין_מידע'::"text" NOT NULL,
     "last_strategy_review_date" "date",
-    "next_strategy_review_date" "date"
+    "next_strategy_review_date" "date",
+    "service_packages" "text"[] DEFAULT '{paid_ads}'::"text"[] NOT NULL,
+    "results_are_conversations" boolean DEFAULT false NOT NULL,
+    CONSTRAINT "businesses_service_packages_valid" CHECK (("service_packages" <@ ARRAY['crm_leads'::"text", 'paid_ads'::"text", 'organic_social'::"text"]))
 );
 
 ALTER TABLE ONLY "public"."businesses" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."businesses" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."businesses"."service_packages" IS 'חבילות השירות של העסק: crm_leads (ניהול לידים/CRM), paid_ads (ממומן), organic_social (סושיאל אורגני)';
+
+
+
+COMMENT ON COLUMN "public"."businesses"."results_are_conversations" IS 'true = התוצאה של הפרסום היא שיחות/הודעות (וואטסאפ/מסנג׳ר/טלפון) ולא טופס ליד; קובע אם מציגים מדדי שיחות והודעות';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."call_webhook_logs" (
@@ -1126,7 +1554,7 @@ CREATE TABLE IF NOT EXISTS "public"."clients" (
     "status" "text" DEFAULT 'חדש'::"text" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "client_type" "text" DEFAULT 'שירות'::"text" NOT NULL,
+    "client_type" "text" DEFAULT 'לידים'::"text" NOT NULL,
     "health_status" "text" DEFAULT 'ok'::"text" NOT NULL,
     "health_reasons" "jsonb" DEFAULT '[]'::"jsonb" NOT NULL,
     "health_checked_at" timestamp with time zone,
@@ -1256,7 +1684,11 @@ CREATE TABLE IF NOT EXISTS "public"."google_ads_metrics" (
     "raw" "jsonb",
     "synced_at" timestamp with time zone DEFAULT "now"(),
     "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"()
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "messaging_actions" integer DEFAULT 0,
+    "call_actions" integer DEFAULT 0,
+    "purchases" integer DEFAULT 0,
+    "purchase_value" numeric DEFAULT 0
 );
 
 
@@ -1342,13 +1774,40 @@ CREATE TABLE IF NOT EXISTS "public"."leads" (
     "business_id" "uuid",
     "status_updated_at" timestamp with time zone,
     "additional_details" "text" DEFAULT ''::"text",
-    "deal_amount" numeric(12,2)
+    "deal_amount" numeric(12,2),
+    "channel" "text",
+    "utm_source" "text",
+    "utm_medium" "text",
+    "utm_campaign" "text",
+    "utm_content" "text",
+    "utm_term" "text",
+    "form_name" "text",
+    "landing_url" "text",
+    "click_id" "text",
+    CONSTRAINT "leads_channel_valid" CHECK ((("channel" IS NULL) OR ("channel" = ANY (ARRAY['phone'::"text", 'website_form'::"text", 'landing_page'::"text", 'facebook_form'::"text", 'instagram_form'::"text", 'google_form'::"text", 'whatsapp'::"text", 'referral'::"text", 'manual'::"text", 'other'::"text"]))))
 );
 
 ALTER TABLE ONLY "public"."leads" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."leads" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."manual_backups" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "scope" "text" NOT NULL,
+    "client_id" "uuid",
+    "client_name" "text",
+    "file_path" "text" NOT NULL,
+    "row_counts" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "total_rows" integer DEFAULT 0 NOT NULL,
+    "created_by" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "manual_backups_scope_check" CHECK (("scope" = ANY (ARRAY['client'::"text", 'all'::"text"])))
+);
+
+
+ALTER TABLE "public"."manual_backups" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."marketing_initiatives" (
@@ -1419,7 +1878,9 @@ CREATE TABLE IF NOT EXISTS "public"."meta_ads_metrics" (
     "engagement_count" integer DEFAULT 0,
     "contact_actions" integer DEFAULT 0,
     "purchases" integer DEFAULT 0,
-    "purchase_value" numeric DEFAULT 0
+    "purchase_value" numeric DEFAULT 0,
+    "messaging_actions" integer DEFAULT 0,
+    "call_actions" integer DEFAULT 0
 );
 
 
@@ -1599,13 +2060,70 @@ CREATE TABLE IF NOT EXISTS "public"."requests" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "sender_id" "uuid",
-    "business_id" "uuid"
+    "business_id" "uuid",
+    "request_type" "text" DEFAULT 'general'::"text" NOT NULL,
+    "details" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "needed_by" "date",
+    CONSTRAINT "requests_request_type_valid" CHECK (("request_type" = ANY (ARRAY['general'::"text", 'question'::"text", 'update'::"text", 'materials'::"text", 'special'::"text", 'issue'::"text"])))
 );
 
 ALTER TABLE ONLY "public"."requests" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."requests" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."requests"."request_type" IS 'question שאלה, update עדכון/שינוי, materials שליחת חומרים, special בקשה מיוחדת/הצעת מחיר, issue דיווח על תקלה, general כללי';
+
+
+
+COMMENT ON COLUMN "public"."requests"."details" IS 'שדות ייעודיים לפי סוג הבקשה (מפתח -> ערך), מוגדרים ב-src/lib/requestTypes.ts';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."social_page_metrics" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "business_id" "uuid" NOT NULL,
+    "client_id" "uuid" NOT NULL,
+    "social_account_id" "uuid" NOT NULL,
+    "platform" "text" NOT NULL,
+    "date" "date" NOT NULL,
+    "followers" integer,
+    "reach" integer,
+    "impressions" integer,
+    "engagements" integer,
+    "profile_views" integer,
+    "follower_gain" integer,
+    "raw" "jsonb",
+    "synced_at" timestamp with time zone DEFAULT "now"()
+);
+
+
+ALTER TABLE "public"."social_page_metrics" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."social_posts" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "business_id" "uuid" NOT NULL,
+    "client_id" "uuid" NOT NULL,
+    "social_account_id" "uuid" NOT NULL,
+    "platform" "text" NOT NULL,
+    "external_id" "text" NOT NULL,
+    "published_at" timestamp with time zone,
+    "permalink" "text",
+    "message" "text",
+    "media_type" "text",
+    "thumbnail_url" "text",
+    "likes" integer DEFAULT 0 NOT NULL,
+    "comments" integer DEFAULT 0 NOT NULL,
+    "shares" integer DEFAULT 0 NOT NULL,
+    "reach" integer,
+    "engagements" integer DEFAULT 0 NOT NULL,
+    "synced_at" timestamp with time zone DEFAULT "now"()
+);
+
+
+ALTER TABLE "public"."social_posts" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."staff_activity_log" (
@@ -1810,6 +2328,16 @@ ALTER TABLE ONLY "public"."work_items" REPLICA IDENTITY FULL;
 ALTER TABLE "public"."work_items" OWNER TO "postgres";
 
 
+ALTER TABLE ONLY "public"."ad_campaigns"
+    ADD CONSTRAINT "ad_campaigns_business_id_platform_campaign_id_key" UNIQUE ("business_id", "platform", "campaign_id");
+
+
+
+ALTER TABLE ONLY "public"."ad_campaigns"
+    ADD CONSTRAINT "ad_campaigns_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."admin_audit_log"
     ADD CONSTRAINT "admin_audit_log_pkey" PRIMARY KEY ("id");
 
@@ -1822,6 +2350,11 @@ ALTER TABLE ONLY "public"."agency_settings"
 
 ALTER TABLE ONLY "public"."agency_settings"
     ADD CONSTRAINT "agency_settings_user_id_key" UNIQUE ("user_id");
+
+
+
+ALTER TABLE ONLY "public"."backup_runs"
+    ADD CONSTRAINT "backup_runs_pkey" PRIMARY KEY ("id");
 
 
 
@@ -1847,6 +2380,16 @@ ALTER TABLE ONLY "public"."business_metrics"
 
 ALTER TABLE ONLY "public"."business_service_items"
     ADD CONSTRAINT "business_service_items_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."business_social_accounts"
+    ADD CONSTRAINT "business_social_accounts_business_id_platform_external_id_key" UNIQUE ("business_id", "platform", "external_id");
+
+
+
+ALTER TABLE ONLY "public"."business_social_accounts"
+    ADD CONSTRAINT "business_social_accounts_pkey" PRIMARY KEY ("id");
 
 
 
@@ -1990,6 +2533,11 @@ ALTER TABLE ONLY "public"."leads"
 
 
 
+ALTER TABLE ONLY "public"."manual_backups"
+    ADD CONSTRAINT "manual_backups_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."marketing_initiatives"
     ADD CONSTRAINT "marketing_initiatives_pkey" PRIMARY KEY ("id");
 
@@ -2067,6 +2615,26 @@ ALTER TABLE ONLY "public"."request_replies"
 
 ALTER TABLE ONLY "public"."requests"
     ADD CONSTRAINT "requests_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."social_page_metrics"
+    ADD CONSTRAINT "social_page_metrics_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."social_page_metrics"
+    ADD CONSTRAINT "social_page_metrics_social_account_id_date_key" UNIQUE ("social_account_id", "date");
+
+
+
+ALTER TABLE ONLY "public"."social_posts"
+    ADD CONSTRAINT "social_posts_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."social_posts"
+    ADD CONSTRAINT "social_posts_social_account_id_external_id_key" UNIQUE ("social_account_id", "external_id");
 
 
 
@@ -2156,7 +2724,27 @@ CREATE INDEX "calls_received_at_idx" ON "public"."calls" USING "btree" ("receive
 
 
 
+CREATE INDEX "idx_ad_campaigns_business" ON "public"."ad_campaigns" USING "btree" ("business_id", "platform");
+
+
+
+CREATE INDEX "idx_admin_audit_log_actor" ON "public"."admin_audit_log" USING "btree" ("admin_user_id", "created_at" DESC);
+
+
+
+CREATE INDEX "idx_admin_audit_log_client_id" ON "public"."admin_audit_log" USING "btree" ("client_id", "created_at" DESC);
+
+
+
 CREATE INDEX "idx_admin_audit_log_created_at" ON "public"."admin_audit_log" USING "btree" ("created_at" DESC);
+
+
+
+CREATE INDEX "idx_admin_audit_log_target_type" ON "public"."admin_audit_log" USING "btree" ("target_type", "created_at" DESC);
+
+
+
+CREATE INDEX "idx_backup_runs_created" ON "public"."backup_runs" USING "btree" ("created_at" DESC);
 
 
 
@@ -2212,6 +2800,18 @@ CREATE INDEX "idx_google_ads_sync_log_started_at" ON "public"."google_ads_sync_l
 
 
 
+CREATE INDEX "idx_leads_business_channel" ON "public"."leads" USING "btree" ("business_id", "channel", "created_at" DESC);
+
+
+
+CREATE INDEX "idx_leads_business_created" ON "public"."leads" USING "btree" ("business_id", "created_at");
+
+
+
+CREATE INDEX "idx_leads_business_utm_campaign" ON "public"."leads" USING "btree" ("business_id", "utm_campaign") WHERE ("utm_campaign" IS NOT NULL);
+
+
+
 CREATE INDEX "idx_marketing_initiatives_business_id" ON "public"."marketing_initiatives" USING "btree" ("business_id");
 
 
@@ -2237,6 +2837,14 @@ CREATE INDEX "idx_monthly_cycles_business_id" ON "public"."monthly_cycles" USING
 
 
 CREATE INDEX "idx_monthly_cycles_client_id" ON "public"."monthly_cycles" USING "btree" ("client_id");
+
+
+
+CREATE INDEX "idx_social_page_metrics_business_date" ON "public"."social_page_metrics" USING "btree" ("business_id", "date" DESC);
+
+
+
+CREATE INDEX "idx_social_posts_business_published" ON "public"."social_posts" USING "btree" ("business_id", "published_at" DESC);
 
 
 
@@ -2316,6 +2924,154 @@ CREATE OR REPLACE TRIGGER "leads_status_updated_at" BEFORE UPDATE ON "public"."l
 
 
 
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."ad_campaigns" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."agency_settings" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."business_competitors" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."business_goals" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."business_metrics" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."business_service_items" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."businesses" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."calls" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."client_ad_accounts" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."client_employees" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."client_updates" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."clients" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."documents" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."freelancer_messages" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."freelancer_services" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."freelancer_task_comments" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."freelancer_tasks" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."incoming_call_webhook_keys" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."incoming_webhook_keys" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."leads" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."manual_backups" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."marketing_initiatives" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."messages" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."monthly_cycles" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."peer_reviews" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."profiles" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."projects" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."reminders" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."reports" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."request_replies" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."requests" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."staff_assignments" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."team_details" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."user_roles" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."webhook_configs" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."weekly_business_reports" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_audit_row_change" AFTER INSERT OR DELETE OR UPDATE ON "public"."work_items" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
+
+
+
 CREATE OR REPLACE TRIGGER "trg_auto_create_lead_from_call" BEFORE INSERT ON "public"."calls" FOR EACH ROW EXECUTE FUNCTION "public"."auto_create_lead_from_call"();
 
 
@@ -2329,6 +3085,10 @@ CREATE OR REPLACE TRIGGER "trg_business_goals_updated_at" BEFORE UPDATE ON "publ
 
 
 CREATE OR REPLACE TRIGGER "trg_business_service_items_updated_at" BEFORE UPDATE ON "public"."business_service_items" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_cascade_client_inactive_to_businesses" AFTER UPDATE OF "status" ON "public"."clients" FOR EACH ROW EXECUTE FUNCTION "public"."cascade_client_inactive_to_businesses"();
 
 
 
@@ -2348,7 +3108,15 @@ CREATE OR REPLACE TRIGGER "trg_client_updates_updated_at" BEFORE UPDATE ON "publ
 
 
 
+CREATE OR REPLACE TRIGGER "trg_deactivate_campaigns_with_account" AFTER UPDATE OF "is_active" ON "public"."client_ad_accounts" FOR EACH ROW EXECUTE FUNCTION "public"."deactivate_campaigns_with_account"();
+
+
+
 CREATE OR REPLACE TRIGGER "trg_disable_webhooks_on_client_inactive" AFTER UPDATE OF "status" ON "public"."clients" FOR EACH ROW EXECUTE FUNCTION "public"."disable_webhooks_on_client_inactive"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_leads_recount" AFTER INSERT OR DELETE OR UPDATE OF "business_id", "created_at" ON "public"."leads" FOR EACH ROW EXECUTE FUNCTION "public"."leads_recount_trigger"();
 
 
 
@@ -2365,6 +3133,14 @@ CREATE OR REPLACE TRIGGER "trg_record_lead_status_change_insert" AFTER INSERT ON
 
 
 CREATE OR REPLACE TRIGGER "trg_record_lead_status_change_update" AFTER UPDATE OF "status" ON "public"."leads" FOR EACH ROW EXECUTE FUNCTION "public"."record_lead_status_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_set_lead_channel" BEFORE INSERT OR UPDATE OF "source" ON "public"."leads" FOR EACH ROW EXECUTE FUNCTION "public"."set_lead_channel"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_sync_client_email_to_auth" AFTER UPDATE OF "email" ON "public"."clients" FOR EACH ROW EXECUTE FUNCTION "public"."sync_client_email_to_auth"();
 
 
 
@@ -2388,11 +3164,19 @@ CREATE OR REPLACE TRIGGER "trg_work_items_updated_at" BEFORE UPDATE ON "public".
 
 
 
+CREATE OR REPLACE TRIGGER "update_ad_campaigns_updated_at" BEFORE UPDATE ON "public"."ad_campaigns" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
 CREATE OR REPLACE TRIGGER "update_agency_settings_updated_at" BEFORE UPDATE ON "public"."agency_settings" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
 
 CREATE OR REPLACE TRIGGER "update_business_metrics_updated_at" BEFORE UPDATE ON "public"."business_metrics" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_business_social_accounts_updated_at" BEFORE UPDATE ON "public"."business_social_accounts" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
 
@@ -2452,6 +3236,16 @@ CREATE OR REPLACE TRIGGER "update_team_details_updated_at" BEFORE UPDATE ON "pub
 
 
 
+ALTER TABLE ONLY "public"."ad_campaigns"
+    ADD CONSTRAINT "ad_campaigns_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."ad_campaigns"
+    ADD CONSTRAINT "ad_campaigns_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."business_competitors"
     ADD CONSTRAINT "business_competitors_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
 
@@ -2489,6 +3283,16 @@ ALTER TABLE ONLY "public"."business_service_items"
 
 ALTER TABLE ONLY "public"."business_service_items"
     ADD CONSTRAINT "business_service_items_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."business_social_accounts"
+    ADD CONSTRAINT "business_social_accounts_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."business_social_accounts"
+    ADD CONSTRAINT "business_social_accounts_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
 
 
 
@@ -2642,6 +3446,16 @@ ALTER TABLE ONLY "public"."leads"
 
 
 
+ALTER TABLE ONLY "public"."manual_backups"
+    ADD CONSTRAINT "manual_backups_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."manual_backups"
+    ADD CONSTRAINT "manual_backups_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id");
+
+
+
 ALTER TABLE ONLY "public"."marketing_initiatives"
     ADD CONSTRAINT "marketing_initiatives_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
 
@@ -2752,6 +3566,36 @@ ALTER TABLE ONLY "public"."requests"
 
 
 
+ALTER TABLE ONLY "public"."social_page_metrics"
+    ADD CONSTRAINT "social_page_metrics_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."social_page_metrics"
+    ADD CONSTRAINT "social_page_metrics_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."social_page_metrics"
+    ADD CONSTRAINT "social_page_metrics_social_account_id_fkey" FOREIGN KEY ("social_account_id") REFERENCES "public"."business_social_accounts"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."social_posts"
+    ADD CONSTRAINT "social_posts_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."social_posts"
+    ADD CONSTRAINT "social_posts_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."social_posts"
+    ADD CONSTRAINT "social_posts_social_account_id_fkey" FOREIGN KEY ("social_account_id") REFERENCES "public"."business_social_accounts"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."staff_activity_log"
     ADD CONSTRAINT "staff_activity_log_business_id_fkey" FOREIGN KEY ("business_id") REFERENCES "public"."businesses"("id") ON DELETE SET NULL;
 
@@ -2840,6 +3684,10 @@ CREATE POLICY "Admin can manage businesses" ON "public"."businesses" TO "authent
 
 
 CREATE POLICY "Admin can manage clients" ON "public"."clients" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
+CREATE POLICY "Admin can manage manual backups" ON "public"."manual_backups" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
 
@@ -2939,6 +3787,10 @@ CREATE POLICY "Admins view audit log" ON "public"."admin_audit_log" FOR SELECT T
 
 
 
+CREATE POLICY "Admins view backup runs" ON "public"."backup_runs" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
 CREATE POLICY "Admins view data integrity log" ON "public"."data_integrity_log" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
@@ -2966,6 +3818,13 @@ CREATE POLICY "Client can insert own leads" ON "public"."leads" FOR INSERT TO "a
   WHERE (("clients"."id" = "leads"."client_id") AND ("clients"."user_id" = "auth"."uid"())))) AND (("business_id" IS NULL) OR (EXISTS ( SELECT 1
    FROM "public"."businesses" "b"
   WHERE (("b"."id" = "leads"."business_id") AND ("b"."client_id" = "leads"."client_id")))))));
+
+
+
+CREATE POLICY "Client can reply on own requests" ON "public"."request_replies" FOR INSERT TO "authenticated" WITH CHECK ((("sender_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM ("public"."requests" "r"
+     JOIN "public"."clients" "c" ON (("c"."id" = "r"."client_id")))
+  WHERE (("r"."id" = "request_replies"."request_id") AND ("c"."user_id" = "auth"."uid"()))))));
 
 
 
@@ -3082,6 +3941,24 @@ CREATE POLICY "Client can view own requests" ON "public"."requests" FOR SELECT T
 
 
 
+CREATE POLICY "Client can view own social accounts" ON "public"."business_social_accounts" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
+   FROM "public"."clients" "c"
+  WHERE (("c"."id" = "business_social_accounts"."client_id") AND ("c"."user_id" = "auth"."uid"())))));
+
+
+
+CREATE POLICY "Client can view own social metrics" ON "public"."social_page_metrics" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
+   FROM "public"."clients"
+  WHERE (("clients"."id" = "social_page_metrics"."client_id") AND ("clients"."user_id" = "auth"."uid"())))));
+
+
+
+CREATE POLICY "Client can view own social posts" ON "public"."social_posts" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
+   FROM "public"."clients"
+  WHERE (("clients"."id" = "social_posts"."client_id") AND ("clients"."user_id" = "auth"."uid"())))));
+
+
+
 CREATE POLICY "Client can view own weekly reports" ON "public"."weekly_business_reports" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."clients"
   WHERE (("clients"."id" = "weekly_business_reports"."client_id") AND ("clients"."user_id" = "auth"."uid"())))));
@@ -3100,11 +3977,23 @@ CREATE POLICY "Client employee can insert leads" ON "public"."leads" FOR INSERT 
 
 
 
+CREATE POLICY "Client employee can reply on requests" ON "public"."request_replies" FOR INSERT TO "authenticated" WITH CHECK ((("sender_id" = "auth"."uid"()) AND "public"."is_client_employee"("auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM "public"."requests" "r"
+  WHERE (("r"."id" = "request_replies"."request_id") AND ("r"."client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND (("r"."business_id" IS NULL) OR ("r"."business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'requests'::"text", 'edit'::"text"))))));
+
+
+
 CREATE POLICY "Client employee can send messages" ON "public"."messages" FOR INSERT TO "authenticated" WITH CHECK ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND ("sender_id" = "auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'messages'::"text", 'edit'::"text")));
 
 
 
 CREATE POLICY "Client employee can update leads" ON "public"."leads" FOR UPDATE TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'leads'::"text", 'edit'::"text"))) WITH CHECK ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND (("business_id" IS NULL) OR ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'leads'::"text", 'edit'::"text")));
+
+
+
+CREATE POLICY "Client employee can view and reply on requests" ON "public"."request_replies" FOR SELECT TO "authenticated" USING (("public"."is_client_employee"("auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM "public"."requests" "r"
+  WHERE (("r"."id" = "request_replies"."request_id") AND ("r"."client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND (("r"."business_id" IS NULL) OR ("r"."business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))) AND "public"."has_portal_permission"("auth"."uid"(), 'requests'::"text", 'view'::"text"))))));
 
 
 
@@ -3160,7 +4049,35 @@ CREATE POLICY "Client employee can view requests" ON "public"."requests" FOR SEL
 
 
 
+CREATE POLICY "Client employee can view social accounts" ON "public"."business_social_accounts" FOR SELECT TO "authenticated" USING (("public"."is_client_employee"("auth"."uid"()) AND ("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))));
+
+
+
+CREATE POLICY "Client employee can view social metrics" ON "public"."social_page_metrics" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"()))) AND "public"."has_portal_permission"("auth"."uid"(), 'analytics'::"text", 'view'::"text")));
+
+
+
+CREATE POLICY "Client employee can view social posts" ON "public"."social_posts" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"()))) AND "public"."has_portal_permission"("auth"."uid"(), 'analytics'::"text", 'view'::"text")));
+
+
+
 CREATE POLICY "Client employee can view weekly reports" ON "public"."weekly_business_reports" FOR SELECT TO "authenticated" USING ((("client_id" = "public"."get_owner_client_id"("auth"."uid"())) AND "public"."is_client_employee"("auth"."uid"()) AND ("business_id" = ANY ("public"."get_allowed_business_ids"("auth"."uid"())))));
+
+
+
+CREATE POLICY "Client side: ad data only for managed" ON "public"."ad_campaigns" AS RESTRICTIVE FOR SELECT TO "authenticated" USING (((NOT "public"."is_client_side_user"()) OR "public"."business_is_managed"("business_id")));
+
+
+
+CREATE POLICY "Client side: ad data only for managed" ON "public"."google_ads_metrics" AS RESTRICTIVE FOR SELECT TO "authenticated" USING (((NOT "public"."is_client_side_user"()) OR "public"."business_is_managed"("business_id")));
+
+
+
+CREATE POLICY "Client side: ad data only for managed" ON "public"."meta_ads_metrics" AS RESTRICTIVE FOR SELECT TO "authenticated" USING (((NOT "public"."is_client_side_user"()) OR "public"."business_is_managed"("business_id")));
+
+
+
+CREATE POLICY "Client side: ad spend rows only for managed" ON "public"."business_metrics" AS RESTRICTIVE FOR SELECT TO "authenticated" USING (((NOT "public"."is_client_side_user"()) OR ("platform" = 'CRM'::"text") OR (COALESCE("ad_spend", (0)::numeric) = (0)::numeric) OR "public"."business_is_managed"("business_id")));
 
 
 
@@ -3216,6 +4133,10 @@ CREATE POLICY "Only admins can delete roles" ON "public"."user_roles" AS RESTRIC
 
 
 
+CREATE POLICY "Only admins can delete work items" ON "public"."work_items" AS RESTRICTIVE FOR DELETE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+
+
+
 CREATE POLICY "Only admins can insert roles" ON "public"."user_roles" AS RESTRICTIVE FOR INSERT TO "authenticated" WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
@@ -3243,6 +4164,10 @@ CREATE POLICY "Staff can log own activity" ON "public"."staff_activity_log" FOR 
 
 
 CREATE POLICY "Staff can manage assigned ad account mappings" ON "public"."client_ad_accounts" TO "authenticated" USING ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) WITH CHECK ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id"));
+
+
+
+CREATE POLICY "Staff can manage assigned ad campaigns" ON "public"."ad_campaigns" TO "authenticated" USING ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) WITH CHECK ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id"));
 
 
 
@@ -3358,6 +4283,18 @@ CREATE POLICY "Staff can view own assignments" ON "public"."staff_assignments" F
 
 
 
+CREATE POLICY "Staff manage assigned social accounts" ON "public"."business_social_accounts" TO "authenticated" USING ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) WITH CHECK ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id"));
+
+
+
+CREATE POLICY "Staff manage assigned social metrics" ON "public"."social_page_metrics" TO "authenticated" USING ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) WITH CHECK ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id"));
+
+
+
+CREATE POLICY "Staff manage assigned social posts" ON "public"."social_posts" TO "authenticated" USING ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id")) WITH CHECK ("public"."is_staff_assigned_to_business"("auth"."uid"(), "business_id"));
+
+
+
 CREATE POLICY "System inserts profiles" ON "public"."profiles" FOR INSERT TO "authenticated" WITH CHECK (("auth"."uid"() = "user_id"));
 
 
@@ -3388,10 +4325,16 @@ CREATE POLICY "Users manage their own reminders" ON "public"."reminders" USING (
 
 
 
+ALTER TABLE "public"."ad_campaigns" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."admin_audit_log" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."agency_settings" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."backup_runs" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."business_competitors" ENABLE ROW LEVEL SECURITY;
@@ -3404,6 +4347,9 @@ ALTER TABLE "public"."business_metrics" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."business_service_items" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."business_social_accounts" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."businesses" ENABLE ROW LEVEL SECURITY;
@@ -3466,6 +4412,9 @@ ALTER TABLE "public"."lead_status_history" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."leads" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."manual_backups" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."marketing_initiatives" ENABLE ROW LEVEL SECURITY;
 
 
@@ -3503,6 +4452,12 @@ ALTER TABLE "public"."request_replies" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."requests" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."social_page_metrics" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."social_posts" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."staff_activity_log" ENABLE ROW LEVEL SECURITY;
@@ -3879,6 +4834,24 @@ GRANT ALL ON FUNCTION "public"."admin_get_staff_allowed_platforms"("_target_user
 
 
 
+GRANT ALL ON FUNCTION "public"."audit_mask_secrets"("_row" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."audit_mask_secrets"("_row" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."audit_mask_secrets"("_row" "jsonb") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."audit_row_change"() TO "anon";
+GRANT ALL ON FUNCTION "public"."audit_row_change"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."audit_row_change"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."audit_user_login"() TO "anon";
+GRANT ALL ON FUNCTION "public"."audit_user_login"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."audit_user_login"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."auto_create_lead_from_call"() TO "anon";
 GRANT ALL ON FUNCTION "public"."auto_create_lead_from_call"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."auto_create_lead_from_call"() TO "service_role";
@@ -3890,8 +4863,20 @@ GRANT ALL ON FUNCTION "public"."block_unknown_google_signup"() TO "service_role"
 
 
 
+GRANT ALL ON FUNCTION "public"."business_is_managed"("_business_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."business_is_managed"("_business_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."business_is_managed"("_business_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."can_access_business"("_user_id" "uuid", "_business_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."can_access_business"("_user_id" "uuid", "_business_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."cascade_client_inactive_to_businesses"() TO "anon";
+GRANT ALL ON FUNCTION "public"."cascade_client_inactive_to_businesses"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cascade_client_inactive_to_businesses"() TO "service_role";
 
 
 
@@ -3918,6 +4903,12 @@ GRANT ALL ON FUNCTION "public"."clear_health_status_on_deactivate"() TO "service
 
 GRANT ALL ON FUNCTION "public"."client_has_active_call_webhook"("_business_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."client_has_active_call_webhook"("_business_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."deactivate_campaigns_with_account"() TO "anon";
+GRANT ALL ON FUNCTION "public"."deactivate_campaigns_with_account"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."deactivate_campaigns_with_account"() TO "service_role";
 
 
 
@@ -4006,6 +4997,12 @@ GRANT ALL ON FUNCTION "public"."is_client_employee"("_user_id" "uuid") TO "servi
 
 
 
+GRANT ALL ON FUNCTION "public"."is_client_side_user"() TO "anon";
+GRANT ALL ON FUNCTION "public"."is_client_side_user"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_client_side_user"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."is_staff_assigned_to_business"("_user_id" "uuid", "_business_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."is_staff_assigned_to_business"("_user_id" "uuid", "_business_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."is_staff_assigned_to_business"("_user_id" "uuid", "_business_id" "uuid") TO "service_role";
@@ -4018,14 +5015,49 @@ GRANT ALL ON FUNCTION "public"."is_staff_assigned_to_client"("_user_id" "uuid", 
 
 
 
+GRANT ALL ON FUNCTION "public"."lead_channel_of"("_source" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."lead_channel_of"("_source" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."lead_channel_of"("_source" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."leads_recount_trigger"() TO "anon";
+GRANT ALL ON FUNCTION "public"."leads_recount_trigger"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."leads_recount_trigger"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."record_lead_status_change"() TO "anon";
 GRANT ALL ON FUNCTION "public"."record_lead_status_change"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."record_lead_status_change"() TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."recount_business_leads"("_business_id" "uuid", "_month" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."recount_business_leads"("_business_id" "uuid", "_month" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."recount_business_leads"("_business_id" "uuid", "_month" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."revoke_user_sessions"("_user_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."revoke_user_sessions"("_user_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."rls_auto_enable"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."rls_auto_enable"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."set_lead_channel"() TO "anon";
+GRANT ALL ON FUNCTION "public"."set_lead_channel"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_lead_channel"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."sync_client_email_to_auth"() TO "anon";
+GRANT ALL ON FUNCTION "public"."sync_client_email_to_auth"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."sync_client_email_to_auth"() TO "service_role";
 
 
 
@@ -4080,6 +5112,12 @@ GRANT ALL ON FUNCTION "public"."validate_client_employee_businesses"() TO "servi
 
 
 
+GRANT ALL ON TABLE "public"."ad_campaigns" TO "anon";
+GRANT ALL ON TABLE "public"."ad_campaigns" TO "authenticated";
+GRANT ALL ON TABLE "public"."ad_campaigns" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."admin_audit_log" TO "anon";
 GRANT ALL ON TABLE "public"."admin_audit_log" TO "authenticated";
 GRANT ALL ON TABLE "public"."admin_audit_log" TO "service_role";
@@ -4089,6 +5127,12 @@ GRANT ALL ON TABLE "public"."admin_audit_log" TO "service_role";
 GRANT ALL ON TABLE "public"."agency_settings" TO "anon";
 GRANT ALL ON TABLE "public"."agency_settings" TO "authenticated";
 GRANT ALL ON TABLE "public"."agency_settings" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."backup_runs" TO "anon";
+GRANT ALL ON TABLE "public"."backup_runs" TO "authenticated";
+GRANT ALL ON TABLE "public"."backup_runs" TO "service_role";
 
 
 
@@ -4113,6 +5157,12 @@ GRANT ALL ON TABLE "public"."business_metrics" TO "service_role";
 GRANT ALL ON TABLE "public"."business_service_items" TO "anon";
 GRANT ALL ON TABLE "public"."business_service_items" TO "authenticated";
 GRANT ALL ON TABLE "public"."business_service_items" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."business_social_accounts" TO "anon";
+GRANT ALL ON TABLE "public"."business_social_accounts" TO "authenticated";
+GRANT ALL ON TABLE "public"."business_social_accounts" TO "service_role";
 
 
 
@@ -4236,6 +5286,12 @@ GRANT ALL ON TABLE "public"."leads" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."manual_backups" TO "anon";
+GRANT ALL ON TABLE "public"."manual_backups" TO "authenticated";
+GRANT ALL ON TABLE "public"."manual_backups" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."marketing_initiatives" TO "anon";
 GRANT ALL ON TABLE "public"."marketing_initiatives" TO "authenticated";
 GRANT ALL ON TABLE "public"."marketing_initiatives" TO "service_role";
@@ -4311,6 +5367,18 @@ GRANT ALL ON TABLE "public"."request_replies" TO "service_role";
 GRANT ALL ON TABLE "public"."requests" TO "anon";
 GRANT ALL ON TABLE "public"."requests" TO "authenticated";
 GRANT ALL ON TABLE "public"."requests" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."social_page_metrics" TO "anon";
+GRANT ALL ON TABLE "public"."social_page_metrics" TO "authenticated";
+GRANT ALL ON TABLE "public"."social_page_metrics" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."social_posts" TO "anon";
+GRANT ALL ON TABLE "public"."social_posts" TO "authenticated";
+GRANT ALL ON TABLE "public"."social_posts" TO "service_role";
 
 
 
